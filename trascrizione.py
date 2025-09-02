@@ -1,347 +1,194 @@
-
-import os
 import io
-import re
-import json
+import os
 import time
+import math
+import re
 from datetime import timedelta
 
 import streamlit as st
-from faster_whisper import WhisperModel
 import ffmpeg
-import requests
+from faster_whisper import WhisperModel
 
-APP_TITLE = "Trascrizione audio by Roberto M."
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def human_time(seconds: float) -> str:
-    if seconds is None:
-        return "N/D"
-    seconds = max(0, int(round(seconds)))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+# ---------- Utils ----------
+def seconds_to_mmss(s: float) -> str:
+    s = max(0, int(round(s)))
+    return f"{s//60:02d}:{s%60:02d}"
 
-def probe_duration(file_path: str) -> float | None:
-    try:
-        info = ffmpeg.probe(file_path)
-        return float(info["format"]["duration"])
-    except Exception:
-        return None
+def tidy_text(text: str) -> str:
+    """Pulizia leggera + formattazione a capoversi."""
+    if not text:
+        return ""
 
-def format_timestamp_srt(t: float) -> str:
-    # 00:00:00,000
-    ms = int(round((t - int(t)) * 1000))
-    td = timedelta(seconds=int(t))
-    base = str(td)
-    if td.days > 0:
-        # timedelta with days prints like "1 day, HH:MM:SS"
-        base = base.split(", ")[-1]
-    if len(base) == 7:  # M:SS
-        base = "0:" + base
-    if len(base) == 4:  # SSS?
-        base = "00:0" + base
-    if len(base) == 5:  # M:SS but missing hour
-        base = "0:" + base
-    # Ensure HH:MM:SS
-    parts = base.split(":")
-    if len(parts) == 2:
-        base = "00:" + base
-    return f"{base},{ms:03d}"
+    # spazi, punteggiatura, doppie spaziature
+    t = re.sub(r"[ \t]+", " ", text)
+    t = re.sub(r"\s+([,;:.!?])", r"\1", t)
+    t = re.sub(r"([,;])([^\s])", r"\1 \2", t)
 
-def clean_text_basic(text: str) -> str:
-    """Lightweight local improvement: dedup words, fix spaces/punct, capitalize sentence starts, add line breaks."""
-    if not text or not text.strip():
-        return text
+    # parole ripetute immediate (es. "che che", "eh eh")
+    t = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", t, flags=re.IGNORECASE)
 
-    # Normalize whitespace
-    t = re.sub(r"\s+", " ", text).strip()
-
-    # Remove repeated words (up to 3 repetitions)
-    t = re.sub(r"\b(\w+)(\s+\1){1,3}\b", r"\1", t, flags=re.IGNORECASE)
-
-    # Fix spacing around punctuation
-    t = re.sub(r"\s+([,.;:!?])", r"\1", t)
-    t = re.sub(r"([,.;:!?])(?!\s)", r"\1 ", t)
-
-    # Collapse multiple punctuation
-    t = re.sub(r"([.!?]){2,}", r".", t)
-    t = re.sub(r",,", r",", t)
-
-    # Split into sentences and capitalize
-    sentences = re.split(r"(?<=[.!?])\s+", t)
+    # spezza in frasi e metti a capo
+    sentences = re.split(r"(?<=[.!?…])\s+", t.strip())
     sentences = [s.strip().capitalize() for s in sentences if s.strip()]
+    t = "\n\n".join(sentences)
 
-    # Join with paragraph breaks every 2-3 sentences
-    out_lines = []
-    for i, s in enumerate(sentences, start=1):
-        out_lines.append(s)
-        if i % 3 == 0:
-            out_lines.append("")  # blank line
-    out = "\n".join(out_lines).strip()
+    # righe non troppo lunghe (soft wrap mentale; Streamlit fa già il wrap)
+    return t.strip()
 
-    # Ensure reasonable line lengths
-    wrapped = []
-    for para in out.split("\n"):
-        if not para.strip():
-            wrapped.append("")
-            continue
-        line = []
-        count = 0
-        for word in para.split():
-            if count + len(word) + 1 > 110:
-                wrapped.append(" ".join(line))
-                line = [word]
-                count = len(word)
-            else:
-                line.append(word)
-                count += len(word) + 1
-        if line:
-            wrapped.append(" ".join(line))
-    return "\n".join(wrapped).strip()
+def probe_duration(file_path: str) -> float:
+    """Durata in secondi (usa ffmpeg)."""
+    info = ffmpeg.probe(file_path)
+    return float(info["format"]["duration"])
 
-def improve_with_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> str:
-    """Optional AI improvement via OpenAI if API key is provided. Returns improved text or raises."""
-    prompt = (
-        "Sei un editor italiano. Pulisci e migliora il seguente testo di trascrizione: "
-        "correggi ortografia e punteggiatura, elimina ripetizioni ed esitazioni, mantieni il significato, "
-        "aggiungi capoversi logici (ogni 2–3 frasi) e rendi la prosa scorrevole. Non inventare contenuti."
-        "\n\nTesto da migliorare:\n"
+def human_size(num_bytes: int) -> str:
+    for unit in ["B","KB","MB","GB"]:
+        if num_bytes < 1024 or unit == "GB":
+            return f"{num_bytes:.1f}{unit}" if unit != "B" else f"{num_bytes}B"
+        num_bytes /= 1024.0
+
+
+# ---------- UI ----------
+st.set_page_config(page_title="Trascrizione audio by Roberto M.", page_icon="📝", layout="wide")
+
+st.title("Trascrizione audio by Roberto M.")
+st.write("Carica un file audio/video, scegli modello e opzioni, quindi avvia la trascrizione. "
+         "Durante l’elaborazione vedrai una barra di avanzamento con la **stima del tempo residuo**.")
+
+with st.sidebar:
+    st.header("Opzioni")
+    model_size = st.selectbox(
+        "Modello",
+        ["tiny", "base", "small"],
+        index=1,
+        help="Modelli più piccoli si caricano più in fretta ma sono meno accurati. "
+             "‘base’ è un buon compromesso su CPU."
     )
-    payload = {
-        "model": model,
-        "temperature": 0.2,
-        "messages": [
-            {"role": "system", "content": "Sei un assistente utile."},
-            {"role": "user", "content": prompt + text},
-        ],
+    compute_type = st.selectbox(
+        "Precisione (compute_type)",
+        ["int8", "int8_float16", "float16", "float32"],
+        index=0,
+        help="Lascia **int8** (default) per massime prestazioni su CPU."
+    )
+    lang_map = {
+        "Auto (rileva)": None,
+        "Italiano (it)": "it",
+        "English (en)": "en",
+        "Español (es)": "es",
+        "Français (fr)": "fr",
+        "Deutsch (de)": "de",
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(payload), timeout=180)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+    language_label = st.selectbox("Lingua", list(lang_map.keys()), index=0)
+    language = lang_map[language_label]
 
-@st.cache_resource(show_spinner=False)
-def load_model(model_size: str, compute_type: str) -> WhisperModel:
-    return WhisperModel(model_size, compute_type=compute_type)
-
-def make_transcript_text(segments, with_timestamps: bool) -> tuple[str, str | None]:
-    """Return plain_text and srt_text (if timestamps)."""
-    plain_parts = []
-    srt_parts = []
-    if with_timestamps:
-        idx = 1
-        for seg in segments:
-            text = seg.text.strip()
-            plain_parts.append(text)
-            start = float(seg.start or 0.0)
-            end = float(seg.end or 0.0)
-            srt_parts.append(str(idx))
-            srt_parts.append(f"{format_timestamp_srt(start)} --> {format_timestamp_srt(end)}")
-            srt_parts.append(text)
-            srt_parts.append("")  # blank line
-            idx += 1
-        return "\n".join(plain_parts).strip(), "\n".join(srt_parts).strip()
-    else:
-        for seg in segments:
-            plain_parts.append(seg.text.strip())
-        return "\n".join(plain_parts).strip(), None
-
-# ---------------------------
-# UI
-# ---------------------------
-st.set_page_config(page_title=APP_TITLE, page_icon="🎙️", layout="centered")
-st.title(APP_TITLE)
-
-st.write(
-    "Carica un file audio/video, scegli modello e opzioni, quindi avvia la trascrizione. "
-    "Durante l'elaborazione vedrai una barra di avanzamento con la stima del tempo residuo."
-)
+    st.markdown("---")
+    st.subheader("Suggerimenti")
+    st.markdown(
+        "- Scegli **Base** o **Tiny** se sei su CPU.\n"
+        "- Se conosci la lingua, **selezionala** per partire più rapidamente.\n"
+        "- Lascia la precisione su **Int8** per velocità ottimale."
+    )
 
 with st.expander("Opzioni avanzate", expanded=False):
-    col1, col2 = st.columns(2)
-    with col1:
-        model_size = st.selectbox(
-            "Modello Whisper",
-            options=["tiny", "base", "small", "medium", "large-v2"],
-            index=1,
-            help="Modello più piccolo = più veloce; più grande = migliore qualità."
-        )
-    with col2:
-        compute_type = st.selectbox(
-            "Precisione calcolo (compute_type)",
-            options=["int8", "int8_float16", "float16", "float32"],
-            index=0,
-            help="Lascia **int8** per impostazione predefinita: è più veloce e spesso sufficiente."
-        )
+    show_timestamps = st.checkbox("Mostra timecode (disattivato di default)", value=False)
+    auto_tidy = st.checkbox("Migliora e formatta automaticamente", value=True)
+    beam_size = st.slider("Beam size", 1, 5, 1, help="1 è più veloce, >1 leggermente più accurato.")
+    vad_filter = st.checkbox("VAD (filtra silenzi/rumori)", value=True)
 
-    lang = st.selectbox(
-        "Lingua del parlato",
-        options=["auto", "it", "en", "fr", "de", "es", "pt"],
-        index=0,
-        help="Consiglio: se il file NON è in italiano, seleziona la lingua giusta per ridurre gli errori. "
-             "Se non sei sicuro, lascia **auto**."
-    )
-
-    with_ts = st.checkbox("Includi timestamp nei file di output (SRT/VTT)", value=False,
-                          help="Disattivato di default. Abilitalo solo se ti servono i timecode.")
-    auto_improve = st.checkbox("Migliora e formatta automaticamente al termine", value=True)
-
-    method = st.radio(
-        "Metodo di miglioramento",
-        options=["Regole locali (senza AI)", "AI (OpenAI)"],
-        index=0,
-        help="Con l'AI ottieni una riscrittura migliore (serve una API key). Altrimenti si applica una pulizia locale."
-    )
-    openai_key = ""
-    openai_model = "gpt-4o-mini"
-    if method == "AI (OpenAI)":
-        openai_key = st.text_input("OpenAI API Key (facoltativa)", type="password")
-        openai_model = st.text_input("Modello OpenAI", value="gpt-4o-mini")
-
+st.subheader("Carica un file audio/video")
 uploaded = st.file_uploader(
-    "Carica un file audio/video",
+    "Drag and drop file here",
     type=["mp3", "wav", "m4a", "mp4", "aac", "flac", "ogg", "wma", "webm", "mpeg4"],
+    accept_multiple_files=False
 )
 
-# Session state for outputs
-state = st.session_state
-if "raw_text" not in state: state.raw_text = ""
-if "improved_text" not in state: state.improved_text = ""
-if "srt_text" not in state: state.srt_text = None
-if "media_duration" not in state: state.media_duration = None
-if "elapsed" not in state: state.elapsed = 0
+start_btn = st.button("🚀 Avvia trascrizione", disabled=(uploaded is None))
 
-start_btn = st.button("▶️ Avvia trascrizione", type="primary", disabled=uploaded is None)
+hint = st.caption("Suggerimento: carica un file, lascia i timecode disattivati (default) e attiva "
+                  "**'Migliora e formattata automaticamente'** per ottenere subito un testo pulito.")
 
+# ---------- Main logic ----------
 if start_btn and uploaded is not None:
-    # Save temp file
-    tmp_dir = st.experimental_get_query_params().get("tmp_dir", ["/tmp"])[0]
+    # salva file temporaneo
+    tmp_dir = "tmp_inputs"
     os.makedirs(tmp_dir, exist_ok=True)
-    tmp_path = os.path.join(tmp_dir, uploaded.name)
-    with open(tmp_path, "wb") as f:
+    input_path = os.path.join(tmp_dir, uploaded.name)
+    with open(input_path, "wb") as f:
         f.write(uploaded.getbuffer())
 
-    # Duration from ffprobe
-    duration = probe_duration(tmp_path)
-    state.media_duration = duration
+    # durata e dimensione
+    try:
+        total_duration = probe_duration(input_path)
+    except Exception as e:
+        st.error(f"Impossibile leggere la durata del file: {e}")
+        st.stop()
 
-    # Status areas
-    eta_box = st.info(f"Caricamento modello **{model_size}** (compute_type: **{compute_type}**)…")
-    prog = st.progress(0, text="Inizializzazione…")
-    t0 = time.time()
+    st.info(f"Caricato: **{uploaded.name}** · {human_size(len(uploaded.getbuffer()))} · "
+            f"Durata: **{seconds_to_mmss(total_duration)}**")
 
-    # Load model
-    model = load_model(model_size=model_size, compute_type=compute_type)
-
-    # Transcribe
-    prog.progress(10, text="Trascrizione in corso…")
-    language = None if lang == "auto" else lang
-
-    # We iterate segments to build text and update progress if possible
-    segments_iter, info = model.transcribe(
-        tmp_path,
-        language=language,
-        vad_filter=True,
-        word_timestamps=False,  # default senza timestamp parola
-        beam_size=5,
-    )
-
-    segments = []
-    processed_time = 0.0
-    last_update = time.time()
-    for seg in segments_iter:
-        segments.append(seg)
-        processed_time = float(seg.end or processed_time)
-        # Update progress based on media progress if duration known
-        if duration and duration > 0:
-            pct = min(99, int(processed_time / duration * 100))
-            now = time.time()
-            if now - last_update > 0.15:
-                remaining = max(0.0, (duration - processed_time) / max(1e-6, processed_time) * (now - t0)) if processed_time > 1 else None
-                if remaining is not None:
-                    eta_box.info(f"⏳ Stima tempo residuo: **{human_time(remaining)}**")
-                prog.progress(pct, text=f"Elaborazione… {pct}%")
-                last_update = now
-
-    # Build outputs
-    plain_text, srt_text = make_transcript_text(segments, with_timestamps=with_ts)
-    state.raw_text = plain_text
-    state.srt_text = srt_text
-
-    # Auto-improve if requested
-    improved = ""
-    if auto_improve:
+    # carica modello
+    with st.status(f"Caricamento modello **{model_size}** (compute_type: **{compute_type}**)...", expanded=True) as s:
         try:
-            if method == "AI (OpenAI)" and openai_key:
-                improved = improve_with_openai(plain_text, api_key=openai_key, model=openai_model)
-            else:
-                improved = clean_text_basic(plain_text)
+            t0_load = time.time()
+            model = WhisperModel(model_size, device="cpu", compute_type=compute_type)
+            load_time = time.time() - t0_load
+            s.update(label=f"Modello **{model_size}** pronto in {seconds_to_mmss(load_time)}.", state="complete")
         except Exception as e:
-            st.warning(f"Impossibile applicare il miglioramento automatico: {e}")
-            improved = clean_text_basic(plain_text)
-    state.improved_text = improved or ""
+            st.error(f"Errore nel caricamento del modello: {e}")
+            st.stop()
 
-    # Done
-    elapsed = time.time() - t0
-    state.elapsed = elapsed
-    prog.progress(100, text="Completato!")
-    eta_box.success("Trascrizione completata.")
+    # trascrizione streaming con ETA
+    st.subheader("Elaborazione")
+    progress = st.progress(0.0, text="Inizializzazione…")
+    eta_box = st.empty()
 
-# ---------------------------
-# Output area
-# ---------------------------
-if state.raw_text:
-    st.subheader("Esito trascrizione")
+    collected_segments = []
+    plain_text_parts = []
 
-    tabs = st.tabs(["Testo grezzo", "Testo migliorato"])
+    t0 = time.time()
+    processed_sec = 0.0
 
-    with tabs[0]:
-        st.caption("Trascrizione senza timecode (di default).")
-        st.text_area("Output (grezzo)", value=state.raw_text, height=300)
-        st.download_button("⬇️ Scarica .txt (grezzo)", data=state.raw_text, file_name="trascrizione_grezza.txt", mime="text/plain")
+    try:
+        segments, info = model.transcribe(
+            input_path,
+            language=language,
+            task="transcribe",
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        lang_detected = info.language if hasattr(info, "language") else language or "auto"
 
-        if state.srt_text:
-            col_srt, col_vtt = st.columns(2)
-            with col_srt:
-                st.download_button("⬇️ Scarica .srt", data=state.srt_text, file_name="trascrizione.srt", mime="text/plain")
-            with col_vtt:
-                # Simple VTT from SRT
-                vtt = "WEBVTT\n\n" + state.srt_text.replace(",", ".")
-                st.download_button("⬇️ Scarica .vtt", data=vtt, file_name="trascrizione.vtt", mime="text/vtt")
+        for seg in segments:
+            collected_segments.append(seg)
+            plain_text_parts.append(seg.text)
 
-        # Manual improve action (no copia/incolla)
-        st.markdown("—")
-        if st.button("✨ Applica miglioramento ora (senza AI)" if "AI" not in st.session_state.get("method", "x") else "✨ Applica miglioramento ora"):
-            try:
-                if method == "AI (OpenAI)" and openai_key:
-                    state.improved_text = improve_with_openai(state.raw_text, api_key=openai_key, model=openai_model)
-                else:
-                    state.improved_text = clean_text_basic(state.raw_text)
-                st.success("Miglioramento applicato.")
-            except Exception as e:
-                st.error(f"Errore durante il miglioramento: {e}")
+            processed_sec = float(seg.end)
+            frac = min(1.0, processed_sec / total_duration) if total_duration > 0 else 0.0
+            elapsed = time.time() - t0
+            remaining = (elapsed / max(frac, 1e-6)) - elapsed if frac > 0 else 0.0
 
-    with tabs[1]:
-        improved_display = state.improved_text if state.improved_text else "— (non ancora applicato)"
-        st.text_area("Output (migliorato)", value=improved_display, height=300)
-        if state.improved_text:
-            st.download_button("⬇️ Scarica .txt (migliorato)", data=state.improved_text, file_name="trascrizione_migliorata.txt", mime="text/plain")
+            progress.progress(frac, text=f"Avanzamento: {int(frac*100)}%")
+            eta_box.write(f"⏳ Stima tempo residuo: **{seconds_to_mmss(remaining)}**")
 
-    # Info box with durations
-    st.info(
-        f"**Durata del file audio:** {human_time(state.media_duration)} — "
-        f"**Tempo impiegato:** {human_time(state.elapsed)}"
-    )
-else:
-    st.caption("Suggerimento: carica un file, lascia i timecode disattivati (default) e attiva 'Migliora e formatta automaticamente' per ottenere subito un testo pulito.")
+        total_time = time.time() - t0
 
+    except Exception as e:
+        st.error(f"Errore durante la trascrizione: {e}")
+        st.stop()
+
+    progress.progress(1.0, text="Completato")
+    eta_box.empty()
+
+    # compone testo
+    raw_text = " ".join(plain_text_parts).strip()
+
+    if show_timestamps:
+        st.write("#### Trascrizione con timecode")
+        ts_lines = []
+        for s in collected_segments:
+            ts_lines.append(f"[{seconds_to_mmss(s.start)} → {seconds_to_mmss(s.end)}] {s.text.strip()}")
+        st.text_area("Output (con timecode)", "\n".join(ts_lines), height=240)
+
+    # miglioramento automatico
+    final_text = tidy_
