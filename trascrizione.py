@@ -1,275 +1,301 @@
-import os
+# trascrizione.py
+from __future__ import annotations
+
 import io
+import os
 import re
-import json
 import time
 import tempfile
-from dataclasses import dataclass
-from typing import List, Optional
+from typing import Iterable, Tuple, Optional
 
+import numpy as np
 import streamlit as st
 from faster_whisper import WhisperModel
+import ffmpeg
 
-# --------------------------- Config pagina --------------------------- #
 st.set_page_config(
     page_title="Trascrizione audio by Roberto M.",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_icon="🗣️",
+    layout="centered",
 )
 
-# --------------------------- Utilità --------------------------- #
-def format_timestamp(secs: float, srt: bool = True) -> str:
-    if secs < 0:
-        secs = 0
-    millis = int(round(secs * 1000))
-    h = millis // 3_600_000
-    m = (millis % 3_600_000) // 60_000
-    s = (millis % 60_000) // 1000
-    ms = millis % 1000
-    return (f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-            if srt else f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}")
+# ---------- Prompt suggerito (copiabile) ----------
+PROMPT_SUGGERITO = """Sei un editor professionale. Ripulisci la seguente trascrizione SENZA cambiare il significato.
+Regole:
+- Correggi ortografia, punteggiatura e maiuscole.
+- Elimina intercalari/esitazioni (es. “ehm”, “cioè”, “diciamo”), riempitivi e ripetizioni accidentali.
+- Unisci spezzature dovute alla trascrizione e rimuovi eventuali indicazioni non testuali (rumori, timecode).
+- Mantieni citazioni e termini tecnici; non inventare contenuti.
+- Organizza il testo in paragrafi brevi e leggibili. Vai a capo quando cambia tema.
+- Facoltativo: se emergono sezioni chiarissime, puoi aggiungere titoletti Markdown concisi (non forzare).
+- NON riassumere e NON aggiungere commenti.
+Restituisci solo il testo finale pulito in italiano.
+"""
 
-def build_srt(segments: List[dict]) -> str:
-    out = []
-    for i, seg in enumerate(segments, 1):
-        out.append(
-            f"{i}\n"
-            f"{format_timestamp(seg['start'], True)} --> {format_timestamp(seg['end'], True)}\n"
-            f"{seg['text'].strip()}\n"
-        )
-    return "\n".join(out).strip() + "\n"
+# ---------- Utility ----------
+MODEL_CHOICES = ["tiny", "base", "small", "medium"]  # large disabilitato
+DISABLED_MODELS = {"large", "large-v1", "large-v2", "large-v3"}
 
-def build_vtt(segments: List[dict]) -> str:
-    out = ["WEBVTT", ""]
+LANG_CHOICES = {
+    "auto": "Rilevamento automatico",
+    "it": "Italiano",
+    "en": "English",
+    "fr": "Français",
+    "de": "Deutsch",
+    "es": "Español",
+    "pt": "Português",
+}
+
+def format_ts(seconds: float, for_vtt: bool = False) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    ms = int(round((seconds - int(seconds)) * 1000))
+    s = int(seconds) % 60
+    m = (int(seconds) // 60) % 60
+    h = int(seconds) // 3600
+    sep = "." if for_vtt else ","
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+def build_srt(segments: Iterable) -> str:
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        start = format_ts(seg.start, for_vtt=False)
+        end = format_ts(seg.end, for_vtt=False)
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        lines.append(f"{i}")
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+def build_vtt(segments: Iterable) -> str:
+    lines = ["WEBVTT", ""]
     for seg in segments:
-        out.append(
-            f"{format_timestamp(seg['start'], False)} --> {format_timestamp(seg['end'], False)}\n"
-            f"{seg['text'].strip()}\n"
-        )
-    return "\n".join(out).strip() + "\n"
+        start = format_ts(seg.start, for_vtt=True)
+        end = format_ts(seg.end, for_vtt=True)
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
-_caps_re = re.compile(r"([.!?])\s+([a-zàèéìòóù])")
 def tidy_text(text: str) -> str:
     if not text:
         return ""
-    t = text
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"\s+([,.;:!?])", r"\1", t)
-    t = re.sub(r"([,.;:!?])([^\s])", r"\1 \2", t)
-    t = t.strip()
-    def _cap(m): return f"{m.group(1)} {m.group(2).upper()}"
-    t = _caps_re.sub(_cap, t)
-    if t:
-        t = t[0].upper() + t[1:]
-    return t.strip()
+    t = re.sub(r"\s+", " ", text).strip()
+    if not re.search(r"[.!?]", t):
+        return t[:1].upper() + t[1:]
+    parts = re.split(r"([.!?]+)\s*", t)
+    sentences = []
+    for i in range(0, len(parts), 2):
+        fragment = parts[i].strip()
+        punct = parts[i + 1] if i + 1 < len(parts) else ""
+        if not fragment:
+            continue
+        fragment = fragment[:1].upper() + fragment[1:]
+        sentences.append(fragment + punct)
+    out_lines = []
+    bucket = []
+    for s in sentences:
+        bucket.append(s)
+        if len(bucket) >= 3:
+            out_lines.append(" ".join(bucket))
+            bucket = []
+    if bucket:
+        out_lines.append(" ".join(bucket))
+    return "\n\n".join(out_lines).strip()
 
-def human_time(secs: float | int | None) -> str:
-    if not secs or secs < 0:
-        return "00:00"
-    secs = int(round(secs))
-    h, r = divmod(secs, 3600)
-    m, s = divmod(r, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+def probe_duration(file_path: str) -> Optional[float]:
+    try:
+        info = ffmpeg.probe(file_path)
+        return float(info["format"]["duration"])
+    except Exception:
+        return None
 
-@dataclass
-class Options:
-    model_name: str = "base"
-    compute_type: str = "int8"
-    language: Optional[str] = None
-    vad_filter: bool = True
-    beam_size: int = 5
-    include_timestamps: bool = False
-    auto_improve: bool = True
-
-# --------------------------- Cache modello --------------------------- #
 @st.cache_resource(show_spinner=False)
-def load_model_cached(model_name: str, compute_type: str) -> WhisperModel:
-    return WhisperModel(model_name, compute_type=compute_type)
+def load_model(name: str, compute_type: str = "int8") -> WhisperModel:
+    if name in DISABLED_MODELS:
+        st.warning("Il modello 'large' è disabilitato. Uso 'medium'.")
+        name = "medium"
+    return WhisperModel(name, compute_type=compute_type)
 
-# --------------------------- Sidebar --------------------------- #
+def transcribe_file(
+    file_path: str,
+    model_name: str,
+    language: str,
+    task: str,
+    beam_size: int = 5,
+    vad_filter: bool = True,
+) -> Tuple[str, list, dict]:
+    model = load_model(model_name, compute_type="int8")
+    lang = None if language == "auto" else language
+    segments_iter, info = model.transcribe(
+        file_path,
+        task="translate" if task == "translate" else "transcribe",
+        language=lang,
+        vad_filter=vad_filter,
+        beam_size=beam_size,
+        temperature=0.0,
+        best_of=5,
+    )
+    segments, texts = [], []
+    for seg in segments_iter:
+        segments.append(seg)
+        if seg.text:
+            texts.append(seg.text.strip())
+    full_text = " ".join(texts).strip()
+    return full_text, segments, {
+        "language": info.language,
+        "language_probability": info.language_probability,
+    }
+
+def bytes_download(data: str, filename: str, mime: str = "text/plain") -> None:
+    st.download_button(
+        "Scarica " + filename,
+        data=data.encode("utf-8"),
+        file_name=filename,
+        mime=mime,
+        use_container_width=True,
+    )
+
+# ---------- Sidebar ----------
 st.sidebar.header("⚙️ Opzioni")
-
 model_name = st.sidebar.selectbox(
     "Modello Whisper",
-    ["tiny", "base", "small", "medium", "large-v3"],
-    index=1,
+    options=MODEL_CHOICES,
+    index=MODEL_CHOICES.index("medium"),
+    help="Modelli disponibili su questa app. 'large' è disabilitato per limiti di memoria.",
 )
-
-compute_type = st.sidebar.selectbox(
-    "Compute type",
-    ["int8", "int8_float16", "int8_float32", "float16", "float32"],
+language_key = st.sidebar.selectbox(
+    "Lingua audio",
+    options=list(LANG_CHOICES.keys()),
+    format_func=lambda k: LANG_CHOICES[k],
     index=0,
 )
-
-language_choice = st.sidebar.selectbox(
-    "Lingua (lascia 'auto' se non sei sicuro)",
-    ["auto", "it", "en", "fr", "de", "es", "pt", "ro", "pl", "nl", "sv", "ru", "uk", "tr"],
+task = st.sidebar.radio(
+    "Operazione",
+    options=["transcribe", "translate"],
+    format_func=lambda v: "Trascrivi (stessa lingua)" if v == "transcribe" else "Traduci in Italiano",
     index=0,
 )
-language = None if language_choice == "auto" else language_choice
+beam_size = st.sidebar.slider("Beam size", 1, 10, 5)
+vad_filter = st.sidebar.toggle("VAD (voice activity detection)", value=True)
 
-vad_filter = st.sidebar.toggle("VAD (voice activity detection)", True)
-beam_size = st.sidebar.slider("Beam size", 1, 10, 5, 1)
+st.sidebar.markdown("---")
+st.sidebar.caption("Se il file NON è in italiano, imposta la lingua corretta o lascia **Rilevamento automatico**.")
 
-st.sidebar.divider()
-include_timestamps = st.sidebar.toggle(
-    "Includi timestamp nei file di output (SRT/VTT)", value=False
-)
-auto_improve = st.sidebar.toggle("Migliora e formatta automaticamente", value=True)
-
-st.sidebar.divider()
-st.sidebar.subheader("📌 Legenda & Suggerimenti")
-st.sidebar.caption(
-    "- **int8** consigliato su CPU\n"
-    "- **VAD** migliora la segmentazione\n"
-    "- **Timestamp** off di default: attivalo solo se vuoi SRT/VTT"
-)
-
-# --------------------------- Header --------------------------- #
+# ---------- UI principale ----------
 st.title("Trascrizione audio by Roberto M.")
 
 with st.expander("Opzioni avanzate (riassunto)", expanded=False):
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Modello", model_name)
-    col2.metric("Compute", compute_type)
-    col3.metric("Beam", beam_size)
-    st.caption("Modifica dalla **sidebar**.")
-
-# --------------------------- Upload --------------------------- #
-uploaded = st.file_uploader(
-    "Carica un file audio/video",
-    type=["mp3", "wav", "m4a", "mp4", "aac", "flac", "ogg", "wma", "webm"],
-)
-start_btn = st.button("Avvia trascrizione", type="primary", disabled=uploaded is None)
-
-# --------------------------- Esecuzione --------------------------- #
-if start_btn and uploaded is not None:
-    opts = Options(
-        model_name=model_name,
-        compute_type=compute_type,
-        language=language,
-        vad_filter=vad_filter,
-        beam_size=beam_size,
-        include_timestamps=include_timestamps,
-        auto_improve=auto_improve,
+    st.write(
+        f"**Modello**: `{model_name}` · **Lingua**: `{LANG_CHOICES[language_key]}` · "
+        f"**Operazione**: `{'Trascrizione' if task=='transcribe' else 'Traduzione in IT'}` · "
+        f"**Beam**: {beam_size} · **VAD**: {'ON' if vad_filter else 'OFF'}"
     )
 
-    t_all_start = time.perf_counter()
+st.subheader("Carica un file audio/video")
+uploaded = st.file_uploader(
+    "Drag and drop file here",
+    type=["mp3", "wav", "m4a", "mp4", "aac", "flac", "ogg", "wma", "webm", "mpeg4"],
+    help="Limite 200MB per file",
+)
+
+col_a, col_b = st.columns(2)
+with_timestamps = col_a.checkbox(
+    "Includi timestamp nei file di output (SRT/VTT)",
+    value=False,
+    help="Disattivato di default. Abilitalo solo se ti serve SRT/VTT con i timecode.",
+)
+auto_improve = col_b.checkbox(
+    "Migliora e formatta automaticamente al termine",
+    value=True,
+    help="Pulisce il testo con semplici regole (maiuscole, spazi, a capo).",
+)
+
+# Suggerimento rapido vicino ai controlli (come da UI iniziale)
+st.caption("Suggerimento: carica un file, lascia i timecode disattivati (default) e attiva ‘Migliora e formatta automaticamente’ per ottenere subito un testo pulito.")
+
+start_btn = st.button("Avvia trascrizione", type="primary", use_container_width=True)
+
+# ---------- Elaborazione ----------
+if uploaded and start_btn:
+    t0 = time.time()
+    status = st.status("Inizio elaborazione…", expanded=True)
+    status.write("① Carico il modello…")
+
+    if model_name in DISABLED_MODELS:
+        st.warning("Il modello 'large' è disabilitato in questa app. Uso 'medium'.")
+        model_name = "medium"
+
+    _ = load_model(model_name)
+    status.update(label="① Modello pronto.", state="running")
+
+    status.write("② Preparo il file…")
+    suffix = "." + uploaded.name.split(".")[-1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded.read())
+        tmp_path = tmp.name
+
+    audio_dur = probe_duration(tmp_path)
+    if audio_dur is not None:
+        mins = int(audio_dur // 60); secs = int(round(audio_dur % 60))
+        status.write(f"Durata audio: **{mins:02d}:{secs:02d}**")
+    status.update(label="② File temporaneo creato.", state="running")
+
+    status.write("③ Trascrivo… (potrebbe richiedere qualche minuto)")
+    progress = st.progress(0)
+    for p in range(0, 70, 5):
+        progress.progress(p); time.sleep(0.02)
+
     try:
-        with st.status("Inizio elaborazione…", expanded=True) as status:
-            st.write("① Carico il modello…")
-            model = load_model_cached(opts.model_name, opts.compute_type)
-            st.write("✅ Modello pronto.")
+        text_raw, segments, info = transcribe_file(
+            tmp_path, model_name, language_key, task, beam_size, vad_filter
+        )
+        progress.progress(90)
 
-            st.write("② Preparo il file…")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded.name}") as tmp:
-                tmp.write(uploaded.read())
-                tmp_path = tmp.name
-            st.write("✅ File temporaneo creato.")
+        status.write("④ Post-processo il testo…")
+        final_text = tidy_text(text_raw) if auto_improve else text_raw
 
-            st.write("③ Trascrivo…")
-            t_tx_start = time.perf_counter()
+        st.subheader("Risultato")
+        st.caption(
+            f"Rilevato: **{info.get('language','?')}** "
+            f"(p={info.get('language_probability', 0):.2f}) · Modello: `{model_name}`"
+        )
+        st.text_area("Testo", value=final_text, height=300)
 
-            # Barra di avanzamento
-            prog_text = st.empty()
-            prog_bar = st.progress(0.0)
+        col1, col2, col3 = st.columns([1,1,1])
+        with col1:
+            bytes_download(final_text, "trascrizione.txt", "text/plain")
+        if with_timestamps:
+            srt = build_srt(segments); vtt = build_vtt(segments)
+            with col2: bytes_download(srt, "trascrizione.srt", "text/srt")
+            with col3: bytes_download(vtt, "trascrizione.vtt", "text/vtt")
 
-            segments_iter, info = model.transcribe(
-                tmp_path,
-                language=opts.language,
-                beam_size=opts.beam_size,
-                vad_filter=opts.vad_filter,
-                word_timestamps=False,
+        # ----- Suggerimento di prompt (sempre disponibile, copiabile) -----
+        with st.expander("💡 Suggerimento di prompt (per rifinitura con un LLM)"):
+            st.caption("Se vuoi rifinire ulteriormente il testo con un LLM (o se disattivi l'opzione di miglioramento automatico), copia questo prompt:")
+            st.code(PROMPT_SUGGERITO, language="markdown")
+
+        progress.progress(100)
+        elapsed = time.time() - t0
+        if audio_dur is not None:
+            st.success(
+                f"Completato in **{elapsed:.1f}s** · Durata audio **{audio_dur:.1f}s** "
+                f"(~{(elapsed/max(audio_dur,1))*100:.0f}% real-time)."
             )
+        else:
+            st.success(f"Completato in **{elapsed:.1f}s**.")
 
-            audio_duration = getattr(info, "duration", None)  # in secondi
-            if audio_duration:
-                st.info(f"Durata audio: **{human_time(audio_duration)}**")
-
-            segments: List[dict] = []
-            raw_parts: List[str] = []
-            last_t = 0.0
-
-            for seg in segments_iter:
-                d = {"id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text}
-                segments.append(d)
-                raw_parts.append(seg.text)
-
-                # Avanzamento
-                last_t = max(last_t, seg.end or 0.0)
-                if audio_duration and audio_duration > 0:
-                    ratio = min(last_t / audio_duration, 1.0)
-                    prog_bar.progress(ratio)
-                    prog_text.markdown(
-                        f"**Avanzamento**: {human_time(last_t)} / {human_time(audio_duration)}"
-                    )
-
-            prog_bar.progress(1.0)
-            prog_text.markdown(
-                f"**Trascrizione completata** · audio {human_time(audio_duration)}"
-                if audio_duration else "**Trascrizione completata**"
-            )
-
-            raw_text = " ".join(p.strip() for p in raw_parts).strip()
-
-            t_tx_end = time.perf_counter()
-            t_tidy_start = time.perf_counter()
-            st.write("④ Pulizia e formattazione…")
-            final_text = tidy_text(raw_text) if opts.auto_improve else raw_text
-            t_tidy_end = time.perf_counter()
-
-            # Output
-            st.write("⑤ Preparo i download…")
-            downloads = []
-
-            txt_bytes = final_text.encode("utf-8")
-            base = os.path.splitext(uploaded.name)[0]
-            downloads.append(("Scarica testo (.txt)", f"{base}_pulito.txt", txt_bytes, "text/plain"))
-
-            if opts.include_timestamps and segments:
-                srt_str = build_srt(segments)
-                vtt_str = build_vtt(segments)
-                downloads.append(("Scarica sottotitoli SRT", f"{base}.srt", srt_str.encode("utf-8"), "text/plain"))
-                downloads.append(("Scarica sottotitoli VTT", f"{base}.vtt", vtt_str.encode("utf-8"), "text/vtt"))
-
-            seg_json = json.dumps({"segments": segments}, ensure_ascii=False, indent=2).encode("utf-8")
-            downloads.append(("Scarica segmenti JSON", f"{base}_segments.json", seg_json, "application/json"))
-
-            status.update(label="Elaborazione completata ✅", state="complete")
-
-        # ------------------- Riepilogo tempi ------------------- #
-        t_all_end = time.perf_counter()
-        colA, colB, colC, colD = st.columns(4)
-        colA.metric("Durata audio", human_time(audio_duration))
-        colB.metric("Trascrizione", human_time(t_tx_end - t_tx_start))
-        colC.metric("Pulizia/formatting", human_time(t_tidy_end - t_tidy_start))
-        colD.metric("Tempo totale", human_time(t_all_end - t_all_start))
-
-        # ------------------- Output UI ------------------- #
-        st.subheader("Anteprima testo")
-        st.caption("Versione **pulita** (se attivata l’opzione).")
-        st.text_area("Testo", value=final_text, height=260)
-
-        st.subheader("Download")
-        cols = st.columns(min(3, len(downloads)))
-        for i, (label, fname, data, mime) in enumerate(downloads):
-            with cols[i % len(cols)]:
-                st.download_button(label, data=data, file_name=fname, mime=mime, use_container_width=True)
-
-        with st.expander("Dettaglio segmenti"):
-            st.dataframe(
-                [{"start": format_timestamp(s["start"]), "end": format_timestamp(s["end"]), "testo": s["text"].strip()} for s in segments],
-                use_container_width=True,
-            )
+        status.update(label="✅ Elaborazione completata.", state="complete")
 
     except Exception as e:
-        st.error("Qualcosa è andato storto durante l’elaborazione.")
-        st.exception(e)
+        status.update(label="Errore durante la trascrizione.", state="error")
+        st.error(f"Si è verificato un errore: {e}")
     finally:
-        try:
-            if 'tmp_path' in locals() and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-else:
-    st.caption("Suggerimento: carica un file, lascia i timecode **disattivati** e attiva **Migliora e formatta automaticamente** per ottenere subito un testo pulito.")
+        try: os.remove(tmp_path)
+        except Exception: pass
