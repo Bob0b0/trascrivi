@@ -1,24 +1,29 @@
 import streamlit as st
 from faster_whisper import WhisperModel
-import tempfile, os, datetime
+import tempfile, os, datetime, time
 import ffmpeg
 
-st.set_page_config(page_title="Trascrizione audio", page_icon="🎙️")
-st.title("🎧 Trascrizione audio con avanzamento (faster-whisper)")
+# ---------------------- Helpers ----------------------
+def fmt_hms(seconds: float) -> str:
+    if seconds is None or seconds == float("inf"):
+        return "--:--"
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-# ---------------- Utilities ----------------
-def fmt_time(ts):
+def fmt_timecode(ts):
     td = datetime.timedelta(seconds=float(ts))
     return str(td)[:12].replace(".", ",").zfill(12)
 
 def to_srt(segments):
     lines = []
     for i, s in enumerate(segments, start=1):
-        lines.append(f"{i}\n{fmt_time(s.start)} --> {fmt_time(s.end)}\n{s.text.strip()}\n")
+        lines.append(f"{i}\n{fmt_timecode(s.start)} --> {fmt_timecode(s.end)}\n{s.text.strip()}\n")
     return "\n".join(lines)
 
 def media_duration_seconds(path: str) -> float:
-    """Legge la durata con ffprobe (in secondi)."""
     try:
         info = ffmpeg.probe(path)
         return float(info.get("format", {}).get("duration", 0.0))
@@ -26,47 +31,53 @@ def media_duration_seconds(path: str) -> float:
         return 0.0
 
 def convert_to_wav_with_progress(src_path: str, progress):
-    """Converte a WAV mono 16kHz mostrando l'avanzamento reale via ffmpeg."""
-    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp_out.close()
-    total = media_duration_seconds(src_path)
-    # Avvia ffmpeg con stream di progresso su stdout
-    process = (
+    """Converte a WAV 16 kHz mono mostrando una barra e una stima dell'ETA."""
+    import time as _t
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    out.close()
+    total_media = media_duration_seconds(src_path)  # secondi del file di origine
+    t0 = _t.time()
+    proc = (
         ffmpeg
         .input(src_path)
-        .output(tmp_out.name, ac=1, ar=16000)
+        .output(out.name, ac=1, ar=16000)
         .global_args("-progress", "pipe:1", "-nostats")
         .overwrite_output()
         .run_async(pipe_stdout=True, pipe_stderr=True)
     )
-
-    # Loop su linee di progresso: cerchiamo "out_time_ms="
+    processed_sec = 0.0
     while True:
-        line = process.stdout.readline()
+        line = proc.stdout.readline()
         if not line:
-            if process.poll() is not None:
+            if proc.poll() is not None:  # processo finito
                 break
             continue
         try:
-            line = line.decode("utf-8", errors="ignore").strip()
+            s = line.decode("utf-8", errors="ignore").strip()
         except Exception:
-            line = ""
-        if line.startswith("out_time_ms="):
+            s = ""
+        if s.startswith("out_time_ms="):
             try:
-                ms = int(line.split("=")[1])
-                if total > 0:
-                    pct = min(100, int((ms / (total * 1_000_000)) * 100))
-                    progress.progress(pct, text=f"Conversione… {pct}%")
+                processed_sec = int(s.split("=")[1]) / 1_000_000.0
             except Exception:
-                pass
-        elif line.startswith("progress=") and line.split("=")[1] == "end":
+                processed_sec = processed_sec
+            # percentuale rispetto alla durata media (non alla velocità reale)
+            pct_media = int(min(100, (processed_sec / max(1e-6, total_media)) * 100))
+            # stima realistica: velocità = media_elaborata / tempo_wall
+            elapsed = max(1e-6, _t.time() - t0)
+            rate = processed_sec / elapsed  # secondi di audio elaborati al secondo
+            remaining = (max(0.0, total_media - processed_sec) / max(1e-6, rate))
+            progress.progress(pct_media, text=f"Conversione… {pct_media}%  • ETA ~ {fmt_hms(remaining)}")
+        elif s.startswith("progress=") and s.split("=")[1] == "end":
             progress.progress(100, text="Conversione completata ✅")
             break
+    proc.wait()
+    return out.name
 
-    process.wait()
-    return tmp_out.name
+# ---------------------- UI ----------------------
+st.set_page_config(page_title="Trascrizione audio by Roberto M.", page_icon="🎙️")
+st.title("🎙️ Trascrizione audio by Roberto M.")
 
-# ---------------- UI ----------------
 uploaded_file = st.file_uploader(
     "📤 Carica un file audio/video (MP3, WAV, M4A, AAC, OGG, FLAC, MP4, MOV, MKV, WEBM, AVI)",
     type=["mp3","wav","m4a","aac","ogg","flac","mp4","mov","mkv","webm","avi"],
@@ -88,35 +99,42 @@ if uploaded_file:
         tmp.write(uploaded_file.read())
         src_path = tmp.name
 
-    # Conversione con avanzamento reale
+    # 1) Conversione con ETA
     st.subheader("1) Conversione con ffmpeg")
-    conv_progress = st.progress(0, text="Preparazione…")
+    conv_bar = st.progress(0, text="Preparazione…")
     try:
-        wav_path = convert_to_wav_with_progress(src_path, conv_progress)
+        wav_path = convert_to_wav_with_progress(src_path, conv_bar)
     except Exception as e:
-        conv_progress.empty()
-        st.error(f"Errore nella conversione con ffmpeg: {e}")
+        conv_bar.empty()
+        st.error(f"Errore nella conversione: {e}")
         st.stop()
 
-    # Trascrizione con avanzamento (in base al tempo dei segmenti)
+    # 2) Trascrizione con ETA
     st.subheader("2) Trascrizione")
-    trans_progress = st.progress(0, text="Carico modello…")
+    trans_bar = st.progress(0, text="Carico modello…")
     try:
-        from time import time
+        t0 = time.time()
         model = WhisperModel(model_size, device="cpu", compute_type=compute)
         segments_gen, info = model.transcribe(
             wav_path,
             language=None if language == "auto" else language,
             vad_filter=vad,
         )
-        total = max(1e-6, float(info.duration or 0.0))
+        total_dur = max(1e-6, float(info.duration or 0.0))  # secondi dell'audio
         segments, last_end = [], 0.0
+
         for seg in segments_gen:
             segments.append(seg)
             last_end = getattr(seg, "end", last_end)
-            pct = min(100, int((last_end / total) * 100))
-            trans_progress.progress(pct, text=f"Trascrizione… {pct}%")
-        trans_progress.progress(100, text="Trascrizione completata ✅")
+            frac = min(1.0, last_end / total_dur)
+            pct = int(frac * 100)
+            elapsed = time.time() - t0
+            # velocità relativa (frazione completata per secondo)
+            rate = max(1e-6, frac / max(1e-6, elapsed))
+            remaining = (1.0 - frac) / rate
+            trans_bar.progress(pct, text=f"Trascrizione… {pct}%  • ETA ~ {fmt_hms(remaining)}")
+
+        trans_bar.progress(100, text="Trascrizione completata ✅")
 
         text = "".join(s.text for s in segments).strip()
         srt_text = to_srt(segments)
@@ -135,14 +153,13 @@ if uploaded_file:
                 st.write(f"[{s.start:.2f} → {s.end:.2f}] {s.text.strip()}")
 
     except Exception as e:
-        trans_progress.empty()
+        trans_bar.empty()
         st.error(f"Errore nella trascrizione: {e}")
     finally:
-        # Pulizia file temporanei
         try: os.unlink(src_path)
         except Exception: pass
         try: os.unlink(wav_path)
         except Exception: pass
 
 else:
-    st.caption("Carica un file per iniziare. Durante conversione e trascrizione vedrai l'avanzamento in tempo reale.")
+    st.caption("Carica un file per iniziare. Durante conversione e trascrizione vedrai l'avanzamento e una stima del tempo residuo.")
