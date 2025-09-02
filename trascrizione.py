@@ -1,165 +1,279 @@
+# trascrizione.py
+import os
+import re
+import time
+import math
+import tempfile
+from datetime import timedelta
+import textwrap
+
 import streamlit as st
 from faster_whisper import WhisperModel
-import tempfile, os, datetime, time
 import ffmpeg
 
-# ---------------------- Helpers ----------------------
-def fmt_hms(seconds: float) -> str:
-    if seconds is None or seconds == float("inf"):
-        return "--:--"
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-def fmt_timecode(ts):
-    td = datetime.timedelta(seconds=float(ts))
-    return str(td)[:12].replace(".", ",").zfill(12)
+# ---------------------------
+# Utilità di formattazione
+# ---------------------------
+def seconds_to_hms(seconds: float) -> str:
+    seconds = max(0, float(seconds or 0.0))
+    return str(timedelta(seconds=int(round(seconds))))
 
-def to_srt(segments):
-    lines = []
-    for i, s in enumerate(segments, start=1):
-        lines.append(f"{i}\n{fmt_timecode(s.start)} --> {fmt_timecode(s.end)}\n{s.text.strip()}\n")
-    return "\n".join(lines)
+def seconds_to_minutes_label(seconds: float, decimals: int = 1) -> str:
+    minutes = (seconds or 0.0) / 60.0
+    return f"{minutes:.{decimals}f} min"
 
-def media_duration_seconds(path: str) -> float:
+def safe_probe_duration(path: str) -> float:
+    """Ritorna la durata in secondi usando ffmpeg.probe; 0 se non disponibile."""
     try:
-        info = ffmpeg.probe(path)
-        return float(info.get("format", {}).get("duration", 0.0))
+        meta = ffmpeg.probe(path)
+        d = float(meta["format"]["duration"])
+        return max(0.0, d)
     except Exception:
         return 0.0
 
-def convert_to_wav_with_progress(src_path: str, progress):
-    """Converte a WAV 16 kHz mono mostrando una barra e una stima dell'ETA."""
-    import time as _t
-    out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    out.close()
-    total_media = media_duration_seconds(src_path)  # secondi del file di origine
-    t0 = _t.time()
-    proc = (
-        ffmpeg
-        .input(src_path)
-        .output(out.name, ac=1, ar=16000)
-        .global_args("-progress", "pipe:1", "-nostats")
-        .overwrite_output()
-        .run_async(pipe_stdout=True, pipe_stderr=True)
-    )
-    processed_sec = 0.0
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:  # processo finito
-                break
-            continue
-        try:
-            s = line.decode("utf-8", errors="ignore").strip()
-        except Exception:
-            s = ""
-        if s.startswith("out_time_ms="):
-            try:
-                processed_sec = int(s.split("=")[1]) / 1_000_000.0
-            except Exception:
-                processed_sec = processed_sec
-            pct_media = int(min(100, (processed_sec / max(1e-6, total_media)) * 100))
-            elapsed = max(1e-6, _t.time() - t0)
-            rate = processed_sec / elapsed  # secondi di audio elaborati al secondo
-            remaining = (max(0.0, total_media - processed_sec) / max(1e-6, rate))
-            progress.progress(pct_media, text=f"Conversione… {pct_media}%  • ETA ~ {fmt_hms(remaining)}")
-        elif s.startswith("progress=") and s.split("=")[1] == "end":
-            progress.progress(100, text="Conversione completata ✅")
-            break
-    proc.wait()
-    return out.name
 
-# ---------------------- UI ----------------------
-st.set_page_config(page_title="Trascrizione audio by Roberto M.", page_icon="🎙️")
-st.title("🎙️ Trascrizione audio by Roberto M.")
+# ---------------------------
+# Pulizia & rifinitura locale del testo
+# ---------------------------
+TS_LINE_RE = re.compile(r'^\s*\[\d{2}:\d{2}(?::\d{2})?\]\s*', flags=re.MULTILINE)
 
-uploaded_file = st.file_uploader(
-    "📤 Carica un file audio/video (MP3, WAV, M4A, AAC, OGG, FLAC, MP4, MOV, MKV, WEBM, AVI)",
-    type=["mp3","wav","m4a","aac","ogg","flac","mp4","mov","mkv","webm","avi"],
+def remove_square_bracket_timestamps(text: str) -> str:
+    return TS_LINE_RE.sub('', text)
+
+def dedup_adjacent_words(text: str) -> str:
+    # "la la la prova" -> "la prova"
+    return re.sub(r'\b(\w+)(\s+\1\b)+', r'\1', text, flags=re.IGNORECASE)
+
+def normalize_spacing_punct(text: str) -> str:
+    t = text
+    # spazi multipli -> singolo
+    t = re.sub(r'[ \t]+', ' ', t)
+    # niente spazio prima di ,;:.!? e uno dopo se manca
+    t = re.sub(r' +([,;:.!?])', r'\1', t)
+    t = re.sub(r'([,;:.!?])(?![\s\)\]\}])', r'\1 ', t)
+    # parentesi e punte: niente spazi interni strani
+    t = re.sub(r'([(\[{]) +', r'\1', t)
+    t = re.sub(r' +([)\]}])', r'\1', t)
+    # puntini ripetuti -> ellissi
+    t = re.sub(r'([.!?]){3,}', '…', t)
+    # normalizza a capo
+    t = re.sub(r'\s*\n\s*', '\n', t)
+    # riduci righe vuote consecutive
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+def split_sentences(text: str):
+    # unisci righe spezzate prima di segmentare
+    t = re.sub(r'\s*\n\s*', ' ', text)
+    # spazio dopo fine frase se manca
+    t = re.sub(r'([.!?…])([^\s])', r'\1 \2', t)
+    # split conservando i segni di fine frase
+    parts = re.split(r'(?<=[.!?…])\s+', t)
+    return [p.strip() for p in parts if p.strip()]
+
+def capitalize_sentences(parts):
+    out = []
+    for s in parts:
+        s = s.strip()
+        if s and s[0].islower():
+            s = s[0].upper() + s[1:]
+        out.append(s)
+    return out
+
+def wrap_lines(text: str, width: int = 100) -> str:
+    wrapped = []
+    for para in text.split("\n"):
+        wrapped.append(textwrap.fill(para, width=width) if para.strip() else "")
+    return "\n".join(wrapped)
+
+def refine_text(
+    text: str,
+    remove_ts: bool = False,
+    dedup_words: bool = True,
+    fix_spacing: bool = True,
+    capitalize: bool = True,
+    line_break_each_sentence: bool = True,
+    wrap_width: int | None = 100,
+) -> str:
+    t = text or ""
+    if remove_ts:
+        t = remove_square_bracket_timestamps(t)
+    if dedup_words:
+        t = dedup_adjacent_words(t)
+    if fix_spacing:
+        t = normalize_spacing_punct(t)
+
+    if line_break_each_sentence:
+        parts = split_sentences(t)
+        if capitalize:
+            parts = capitalize_sentences(parts)
+        t = "\n".join(parts)
+    elif capitalize:
+        parts = split_sentences(t)
+        t = " ".join(capitalize_sentences(parts))
+
+    if wrap_width and wrap_width > 20:
+        t = wrap_lines(t, width=int(wrap_width))
+    return t.strip()
+
+
+# ---------------------------
+# UI
+# ---------------------------
+st.set_page_config(page_title="Trascrizione audio by Roberto M.", page_icon="📝", layout="centered")
+st.title("Trascrizione audio by Roberto M.")
+
+st.markdown(
+    "Carica un file audio/video, scegli modello e opzioni, quindi avvia la trascrizione. "
+    "Durante l’elaborazione vedrai una barra di avanzamento con la **stima del tempo residuo**."
 )
 
-colA, colB, colC, colD = st.columns([1,1,1,1])
-with colA:
-    model_size = st.selectbox("⚙️ Modello", ["tiny", "base", "small", "medium"], index=2)
-with colB:
-    language = st.selectbox("🌍 Lingua", ["auto", "it", "en", "es", "fr", "de"], index=0)
-with colC:
-    compute = st.selectbox("🧮 Precisione (CPU)", ["int8", "int8_float16", "float32"], index=0)
-with colD:
-    vad = st.checkbox("🧹 VAD", value=True, help="Rimuove silenzi/rumori tra frasi")
+# Sidebar — selezioni e guida
+st.sidebar.header("⚙️ Impostazioni")
 
-if uploaded_file:
-    # Salva upload
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
-        tmp.write(uploaded_file.read())
-        src_path = tmp.name
+# Scelta modello
+MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
+model_size = st.sidebar.selectbox("Modello", MODEL_OPTIONS, index=1, help="Modelli piccoli = più veloci, meno accurati. Modelli grandi = più accurati, più lenti.")
 
-    # 1) Conversione con ETA
-    st.subheader("1) Conversione con ffmpeg")
-    conv_bar = st.progress(0, text="Preparazione…")
-    try:
-        wav_path = convert_to_wav_with_progress(src_path, conv_bar)
-    except Exception as e:
-        conv_bar.empty()
-        st.error(f"Errore nella conversione: {e}")
-        st.stop()
+# Precisione (compute_type)
+PRECISION_OPTIONS = ["int8", "int8_float32", "int16", "float16", "float32"]
+compute_type = st.sidebar.selectbox("Precisione (compute_type)", PRECISION_OPTIONS, index=0)
 
-    # 2) Trascrizione con ETA
-    st.subheader("2) Trascrizione")
-    trans_bar = st.progress(0, text="Carico modello…")
-    try:
+# Lingua
+LANG_DISPLAY = [
+    "Auto (rilevamento)",
+    "it — Italiano",
+    "en — English",
+    "es — Español",
+    "fr — Français",
+    "de — Deutsch",
+    "pt — Português",
+]
+lang_display = st.sidebar.selectbox("Lingua dell'audio", LANG_DISPLAY, index=0)
+
+LANG_MAP = {
+    "it — Italiano": "it",
+    "en — English": "en",
+    "es — Español": "es",
+    "fr — Français": "fr",
+    "de — Deutsch": "de",
+    "pt — Português": "pt",
+}
+language = None if lang_display.startswith("Auto") else LANG_MAP.get(lang_display, None)
+
+with st.sidebar.expander("ℹ️ Guida rapida (modelli, lingua, precisione)", expanded=False):
+    st.markdown(
+        """
+**Quale modello scegliere**
+- **tiny/base** → **molto veloci**, **meno accurati** → perfetti per bozze e file brevi.
+- **small** → **buon compromesso** su CPU normali.
+- **medium** → **più accurato**, **più lento**. Consigliato con **GPU**.
+- **large-v3** → **massima qualità**, più pesante (RAM/VRAM), ideale per audio lunghi o difficili.
+
+**Download vs velocità**
+- Al **primo uso** il modello viene **scaricato** (una tantum). Influisce solo sull’**avvio**.
+- La **velocità di trascrizione** dipende da **dimensione del modello** e **hardware** (GPU ≫ CPU).
+
+**Consigli pratici**
+- Se **conosci la lingua** dell’audio, **selezionala** per una stabilità leggermente migliore; altrimenti lascia **Auto**.
+- **Precisione**: lascia **Int8 (default)** su CPU per il miglior rapporto **velocità/qualità**.
+        """
+    )
+st.sidebar.caption("Suggerimento: per file lunghi usa modelli piccoli su CPU, oppure una GPU per i modelli grandi.")
+
+# Opzioni avanzate
+with st.expander("Opzioni avanzate", expanded=False):
+    word_timestamps = st.checkbox("Parole con timestamp (più lento)", value=False)
+    beam_size = st.slider("Beam size", min_value=1, max_value=10, value=5)
+    vad_filter = st.checkbox("VAD filter (migliora segmenti di parlato)", value=True)
+
+uploaded = st.file_uploader(
+    "Carica un file audio/video",
+    type=["mp3", "wav", "m4a", "mp4", "aac", "flac", "ogg", "wma", "webm"],
+    accept_multiple_files=False,
+)
+
+start_button = st.button("▶️ Avvia trascrizione", type="primary", disabled=uploaded is None)
+
+# Output placeholders
+progress_bar = st.progress(0, text="In attesa del file…")
+eta_box = st.empty()
+status_box = st.empty()
+output_box = st.empty()
+metrics_box = st.empty()
+error_box = st.empty()
+
+final_text = ""
+audio_seconds = 0.0
+
+if start_button:
+    if uploaded is None:
+        error_box.error("Nessun file selezionato.")
+    else:
+        # Salva su file temporaneo
+        try:
+            suffix = os.path.splitext(uploaded.name)[-1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded.read())
+                tmp_path = tmp.name
+        except Exception as e:
+            error_box.error(f"Impossibile salvare il file caricato: {e}")
+            st.stop()
+
+        # Durata totale del file (per la barra di avanzamento)
+        total_duration = safe_probe_duration(tmp_path)
+
+        # Carica il modello
+        status_box.info(f"Caricamento modello **{model_size}** (compute_type: **{compute_type}**)…")
+        load_t0 = time.time()
+        try:
+            model = WhisperModel(model_size, device="auto", compute_type=compute_type)
+        except Exception as e:
+            error_box.error(f"Errore nel caricamento del modello: {e}")
+            os.unlink(tmp_path)
+            st.stop()
+        load_elapsed = time.time() - load_t0
+
+        # Avvio trascrizione
+        status_box.info("Trascrizione in corso…")
+        progress_bar.progress(0, text="Analisi iniziale…")
+        eta_box.write("⏳ Stima tempo residuo: —")
+
         t0 = time.time()
-        model = WhisperModel(model_size, device="cpu", compute_type=compute)
-        segments_gen, info = model.transcribe(
-            wav_path,
-            language=None if language == "auto" else language,
-            vad_filter=vad,
-        )
-        total_dur = max(1e-6, float(info.duration or 0.0))  # secondi dell'audio
-        segments, last_end = [], 0.0
+        collected_text = []
+        last_end = 0.0  # per fallback e per progress
 
-        for seg in segments_gen:
-            segments.append(seg)
-            last_end = getattr(seg, "end", last_end)
-            frac = min(1.0, last_end / total_dur)
-            pct = int(frac * 100)
-            elapsed = time.time() - t0
-            rate = max(1e-6, frac / max(1e-6, elapsed))  # frazione per secondo
-            remaining = (1.0 - frac) / rate
-            trans_bar.progress(pct, text=f"Trascrizione… {pct}%  • ETA ~ {fmt_hms(remaining)}")
+        try:
+            segments, info = model.transcribe(
+                tmp_path,
+                language=language,
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+                word_timestamps=word_timestamps,
+            )
 
-        trans_bar.progress(100, text="Trascrizione completata ✅")
+            # Itera sui segmenti e aggiorna la progress bar
+            for seg in segments:
+                # Accumula testo
+                if word_timestamps:
+                    collected_text.append(seg.text.strip())
+                else:
+                    # segmento in forma semplice con timestamp di inizio
+                    collected_text.append(f"[{seconds_to_hms(seg.start)}] {seg.text.strip()}")
 
-        text = "".join(s.text for s in segments).strip()
-        srt_text = to_srt(segments)
+                last_end = float(seg.end or 0.0)
 
-        # Durata in minuti e in mm:ss
-        dur_min = (info.duration or 0.0) / 60.0
-        dur_hms = fmt_hms(info.duration or 0.0)
-        st.success(f"Fatto! Durata: {dur_hms}  ({dur_min:.1f} min) – Segmenti: {len(segments)}")
-        st.text_area("📝 Testo", text, height=300)
+                # Avanzamento & ETA
+                processed = last_end
+                denom = total_duration if total_duration > 0 else max(last_end, 1e-6)
+                frac = min(0.999, processed / denom)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("⬇️ Scarica .txt", text, file_name="trascrizione.txt")
-        with c2:
-            st.download_button("⬇️ Scarica .srt", srt_text, file_name="trascrizione.srt", mime="application/x-subrip")
+                elapsed = time.time() - t0
+                # RTF (real-time factor) su porzione già processata
+                rtf = (elapsed / processed) if processed > 0.5 else None  # evita instabilità iniziale
 
-        with st.expander("📚 Dettaglio segmenti"):
-            for s in segments:
-                st.write(f"[{s.start:.2f} → {s.end:.2f}] {s.text.strip()}")
-
-    except Exception as e:
-        trans_bar.empty()
-        st.error(f"Errore nella trascrizione: {e}")
-    finally:
-        try: os.unlink(src_path)
-        except Exception: pass
-        try: os.unlink(wav_path)
-        except Exception: pass
-
-else:
-    st.caption("Carica un file per iniziare. Conversione e trascrizione mostrano ETA; la durata finale è in minuti e in formato mm:ss.")
+                if rtf is not None and total_duration > 0:
+                    est_total = rtf * total_duration
+                    remaining = max(0.0, est_total - elapsed)
+                    eta_box.write(f"⏳ Stima tempo residuo: **{seconds_to_minutes_label(remaining)}**")
