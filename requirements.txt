@@ -1,18 +1,10 @@
-# Dependencies for the Streamlit transcription app
-# Streamlit UI
+
 streamlit==1.49.1
-
-# Core engine
 faster-whisper==1.0.3
-# Faster-Whisper downloads models from HF Hub
 huggingface-hub>=0.24.0
-
-# Audio/Video handling (read durations, formats)
 av==12.3.0
 ffmpeg-python==0.2.0
-
-# Numeric stack
 numpy>=1.24
-
-# Optional but recommended explicit pin for compatibility with faster-whisper 1.0.x
 ctranslate2>=4.4,<5
+requests>=2.31.0
+
