@@ -121,7 +121,276 @@ MODEL_MB = {
 }
 
 def _repo_candidates(size: str):
-    # Prova prima i repo più recenti, poi fallback storico
+    # Niente f-string per evitare problemi di copia: usiamo concatenazione.
     base = size.replace("_", "-")
-    return [
-        f"Systran/faste
+    repo1 = "Systran/faster-whisper-" + base
+    repo2 = "guillaumekln/faster-whisper-" + base
+    return [repo1, repo2]
+
+def predownload_model_dir(size: str) -> str:
+    last_err = None
+    for repo in _repo_candidates(size):
+        try:
+            local_dir = snapshot_download(
+                repo_id=repo,
+                cache_dir=MODEL_CACHE,
+                resume_download=True,
+                local_files_only=False,
+            )
+            return local_dir
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Download modello '{size}' non riuscito: {last_err}")
+
+@st.cache_resource(show_spinner=False)
+def get_model(size: str, compute_type: str) -> 'WhisperModel':
+    # Garantisce che i file siano già in cache, poi istanzia il modello
+    local_dir = predownload_model_dir(size)
+    return WhisperModel(local_dir, device="auto", compute_type=compute_type)
+
+# ---------------------------
+# UI
+# ---------------------------
+st.set_page_config(page_title="Trascrizione audio by Roberto M.", page_icon="📝", layout="centered")
+st.title("Trascrizione audio by Roberto M.")
+
+st.markdown(
+    "Carica un file audio/video, scegli modello e opzioni, quindi avvia la trascrizione. "
+    "Durante l’elaborazione vedrai una barra di avanzamento con la **stima del tempo residuo**."
+)
+
+# Sidebar — selezioni e guida
+st.sidebar.header("⚙️ Impostazioni")
+
+MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
+model_size = st.sidebar.selectbox("Modello", MODEL_OPTIONS, index=1, help="Modelli piccoli = più veloci, meno accurati. Modelli grandi = più accurati, più lenti.")
+
+PRECISION_OPTIONS = ["int8", "int8_float32", "int16", "float16", "float32"]
+compute_type = st.sidebar.selectbox("Precisione (compute_type)", PRECISION_OPTIONS, index=0)
+
+LANG_DISPLAY = [
+    "Auto (rilevamento)",
+    "it — Italiano",
+    "en — English",
+    "es — Español",
+    "fr — Français",
+    "de — Deutsch",
+    "pt — Português",
+]
+lang_display = st.sidebar.selectbox("Lingua dell'audio", LANG_DISPLAY, index=0)
+LANG_MAP = {
+    "it — Italiano": "it",
+    "en — English": "en",
+    "es — Español": "es",
+    "fr — Français": "fr",
+    "de — Deutsch": "de",
+    "pt — Português": "pt",
+}
+language = None if lang_display.startswith("Auto") else LANG_MAP.get(lang_display, None)
+
+with st.sidebar.expander("ℹ️ Guida rapida (modelli, lingua, precisione)", expanded=False):
+    st.markdown(
+        """
+**Quale modello scegliere**
+- **tiny/base** → **molto veloci**, **meno accurati** → perfetti per bozze e file brevi.
+- **small** → **buon compromesso** su CPU normali.
+- **medium** → **più accurato**, **più lento**. Consigliato con **GPU**.
+- **large-v3** → **massima qualità**, più pesante (RAM/VRAM), ideale per audio lunghi o difficili.
+
+**Download vs velocità**
+- Al **primo uso** il modello viene **scaricato** (una tantum). Influisce solo sull’**avvio**.
+- La **velocità di trascrizione** dipende da **dimensione del modello** e **hardware** (GPU ≫ CPU).
+
+**Consigli pratici**
+- Se **conosci la lingua** dell’audio, **selezionala**; altrimenti lascia **Auto**.
+- **Precisione**: lascia **Int8 (default)** su CPU per il miglior rapporto **velocità/qualità**.
+        """
+    )
+st.sidebar.caption("Suggerimento: per file lunghi usa modelli piccoli su CPU, oppure una GPU per i modelli grandi.")
+
+# Opzioni avanzate
+with st.expander("Opzioni avanzate", expanded=False):
+    word_timestamps = st.checkbox("Parole con timestamp (più lento)", value=False)
+    beam_size = st.slider("Beam size", min_value=1, max_value=10, value=5)
+    vad_filter = st.checkbox("VAD filter (migliora segmenti di parlato)", value=True)
+
+uploaded = st.file_uploader(
+    "Carica un file audio/video",
+    type=["mp3", "wav", "m4a", "mp4", "aac", "flac", "ogg", "wma", "webm"],
+    accept_multiple_files=False,
+)
+
+start_button = st.button("▶️ Avvia trascrizione", type="primary", disabled=uploaded is None)
+
+# Output placeholders
+progress_bar = st.progress(0, text="In attesa del file…")
+eta_box = st.empty()
+status_box = st.empty()
+output_box = st.empty()
+metrics_box = st.empty()
+error_box = st.empty()
+
+final_text = ""
+audio_seconds = 0.0
+
+if start_button:
+    if uploaded is None:
+        error_box.error("Nessun file selezionato.")
+    else:
+        # Salva su file temporaneo
+        try:
+            suffix = os.path.splitext(uploaded.name)[-1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded.read())
+                tmp_path = tmp.name
+        except Exception as e:
+            error_box.error(f"Impossibile salvare il file caricato: {e}")
+            st.stop()
+
+        total_duration = safe_probe_duration(tmp_path)
+
+        # Carica o pre-scarica il modello con messaggio esplicito
+        approx = MODEL_MB.get(model_size, None)
+        size_hint = f" (~{approx} MB da scaricare la prima volta)" if approx else ""
+        status_box.info(f"Caricamento modello **{model_size}** (compute_type: **{compute_type}**){size_hint}…")
+
+        load_t0 = time.time()
+        try:
+            with st.spinner("Preparazione del modello…"):
+                model = get_model(model_size, compute_type)
+        except Exception as e:
+            error_box.error(
+                "Errore nel caricamento del modello. Prova con **tiny** o **base** e verifica la connessione di rete. "
+                f"Dettagli: {e}"
+            )
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            st.stop()
+        load_elapsed = time.time() - load_t0
+
+        # Avvio trascrizione
+        status_box.info("Trascrizione in corso…")
+        progress_bar.progress(0, text="Analisi iniziale…")
+        eta_box.write("⏳ Stima tempo residuo: —")
+
+        t0 = time.time()
+        collected_text = []
+        last_end = 0.0
+
+        try:
+            segments, info = model.transcribe(
+                tmp_path,
+                language=language,
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+                word_timestamps=word_timestamps,
+            )
+
+            for seg in segments:
+                if word_timestamps:
+                    collected_text.append(seg.text.strip())
+                else:
+                    collected_text.append(f"[{seconds_to_hms(seg.start)}] {seg.text.strip()}")
+
+                last_end = float(seg.end or 0.0)
+                processed = last_end
+                denom = total_duration if total_duration > 0 else max(last_end, 1e-6)
+                frac = max(0.0, min(0.999, processed / denom))
+
+                elapsed = time.time() - t0
+                rtf = (elapsed / processed) if processed > 0.5 else None
+
+                if rtf is not None and total_duration > 0:
+                    est_total = rtf * total_duration
+                    remaining = max(0.0, est_total - elapsed)
+                    eta_box.write(f"⏳ Stima tempo residuo: **{seconds_to_minutes_label(remaining)}**")
+                else:
+                    eta_box.write("⏳ Stima tempo residuo: —")
+
+                percent = min(99, int(frac * 100))
+                progress_bar.progress(percent, text=f"Elaborazione… {percent}%")
+
+            progress_bar.progress(100, text="Completato ✅")
+            status_box.success(f"Trascrizione completata. Rilevata lingua: **{getattr(info, 'language', '—')}**")
+
+        except Exception as e:
+            error_box.error(f"Errore durante la trascrizione: {e}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+        final_text = "\n".join(collected_text).strip()
+        if not final_text:
+            final_text = "(Nessun parlato rilevato o testo vuoto)"
+
+        output_box.text_area("Testo trascritto", value=final_text, height=350)
+
+        total_elapsed = time.time() - t0
+        audio_seconds = total_duration if total_duration > 0 else last_end
+        rtf_final = (total_elapsed / audio_seconds) if audio_seconds > 0 else float("nan")
+
+        metrics_box.info(
+            f"**Durata del file audio:** {seconds_to_minutes_label(audio_seconds)}  \n"
+            f"**Tempo impiegato (trascrizione):** {seconds_to_minutes_label(total_elapsed)}  \n"
+            f"**Fattore tempo reale (RTF):** {rtf_final:.2f}×  \n"
+            f"**Tempo caricamento modello:** {seconds_to_minutes_label(load_elapsed)}"
+        )
+
+        st.download_button("💾 Scarica testo (.txt)", data=final_text, file_name="trascrizione.txt", mime="text/plain")
+
+# ---------------------------
+# ✍️ Migliora & formatta testo (locale)
+# ---------------------------
+st.markdown("---")
+st.subheader("✍️ Migliora & formatta testo")
+st.caption("Pulizia locale (senza AI): rimuove timestamp, sistema punteggiatura/spazi, va a capo a fine periodo, capitalizza e consente il download del testo rivisto.")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    opt_remove_ts = st.checkbox("Rimuovi timestamp [hh:mm:ss]", value=False)
+with col2:
+    opt_dedup = st.checkbox("Elimina ripetizioni ravvicinate", value=True)
+with col3:
+    opt_caps = st.checkbox("Capitalizza inizio frase", value=True)
+
+col4, col5 = st.columns(2)
+with col4:
+    opt_linebreaks = st.checkbox("A capo ogni periodo", value=True)
+with col5:
+    wrap_w = st.slider("Larghezza di riga (wrapping)", 60, 140, 100)
+
+src_text = st.text_area("Sorgente da rifinire", value="", height=220)
+apply_btn = st.button("✨ Applica miglioramenti")
+
+if apply_btn:
+    refined = refine_text(
+        src_text,
+        remove_ts=opt_remove_ts,
+        dedup_words=opt_dedup,
+        fix_spacing=True,
+        capitalize=opt_caps,
+        line_break_each_sentence=opt_linebreaks,
+        wrap_width=wrap_w,
+    )
+    st.text_area("Risultato rifinito", value=refined, height=300)
+    st.download_button("💾 Scarica testo rivisto (.txt)", data=refined, file_name="trascrizione_rivista.txt", mime="text/plain")
+
+# ---------------------------
+# 🤖 Prompt consigliato per revisione AI
+# ---------------------------
+with st.expander("🤖 Vuoi una revisione 'di stile' con AI? Prompt consigliato (copia e incolla)", expanded=False):
+    prompt_ai = """Agisci come un revisore editoriale in italiano.
+Obiettivo: correggi refusi, sintassi e punteggiatura; elimina ripetizioni e intercalari; migliora la scorrevolezza senza alterare il contenuto; vai a capo a fine periodo; mantieni il registro neutro-professionale.
+
+Restituisci SOLO il testo rivisto, senza commenti.
+
+Testo da rivedere:
+<<<
+[INCOPIA QUI IL TESTO DA RIVEDERE]
+>>>"""
+    st.code(prompt_ai, language="text")
+    st.caption("Suggerimento: incolla il testo trascritto o già rifinito nel blocco tra <<< e >>>.")
