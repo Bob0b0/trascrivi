@@ -24,23 +24,13 @@ def tidy_text(text: str) -> str:
         return ""
 
     t = text.replace("\r", " ").strip()
+    t = re.sub(r"[ \t]+", " ", t)                       # comprime spazi
+    t = re.sub(r"\s+([,;:.!?…])", r"\1", t)             # no spazio prima di punteggiatura
+    t = re.sub(r"([,;])([^\s])", r"\1 \2", t)           # spazio dopo , ;
+    t = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", t, flags=re.IGNORECASE)  # ripetizioni
 
-    # comprime spazi/tabs
-    t = re.sub(r"[ \t]+", " ", t)
-
-    # niente spazio prima di punteggiatura
-    t = re.sub(r"\s+([,;:.!?…])", r"\1", t)
-
-    # spazio dopo virgola e punto e virgola se manca
-    t = re.sub(r"([,;])([^\s])", r"\1 \2", t)
-
-    # rimozione ripetizioni immediate di una parola (molto semplice)
-    t = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", t, flags=re.IGNORECASE)
-
-    # frasi su . ! ? …
     sentences = re.split(r"(?<=[.!?…])\s+", t)
     sentences = [s.strip().capitalize() for s in sentences if s.strip()]
-
     return "\n\n".join(sentences).strip()
 
 
@@ -58,19 +48,12 @@ def segments_to_text_and_srt(segments) -> Tuple[str, str]:
     pieces: List[str] = []
     srt_lines: List[str] = []
     idx = 1
-
     for seg in segments:
-        # testo “grezzo” senza timecode
         pieces.append(seg.text.strip())
-
-        # srt
         start = sec_to_srt_time(seg.start)
         end = sec_to_srt_time(seg.end)
-        srt_lines.append(
-            f"{idx}\n{start} --> {end}\n{seg.text.strip()}\n"
-        )
+        srt_lines.append(f"{idx}\n{start} --> {end}\n{seg.text.strip()}\n")
         idx += 1
-
     raw_text = " ".join(pieces).strip()
     srt_text = "\n".join(srt_lines).strip()
     return raw_text, srt_text
@@ -86,13 +69,8 @@ def save_bytes_for_download(content: str, suffix: str) -> str:
 
 # ---------------------------- UI / App ----------------------------------------
 
-st.set_page_config(
-    page_title="Trascrizione audio by Roberto M.",
-    layout="centered",
-)
-
+st.set_page_config(page_title="Trascrizione audio by Roberto M.", layout="centered")
 st.title("Trascrizione audio by Roberto M.")
-
 st.write(
     "Carica un file audio/video, scegli modello e opzioni, quindi avvia la trascrizione. "
     "Durante l'elaborazione vedrai una barra di avanzamento con la stima del tempo residuo."
@@ -102,24 +80,21 @@ with st.expander("Opzioni avanzate", expanded=False):
     model_name = st.selectbox(
         "Modello Whisper",
         options=["tiny", "base", "small", "medium", "large-v3"],
-        index=1,  # default: base
-        help=(
-            "Più il modello è grande, più la qualità tende a salire ma aumenta il tempo di calcolo. "
-            "Su CPU è consigliato 'base' o 'small'."
-        ),
+        index=1,
+        help="Più il modello è grande, più la qualità tende a salire ma aumenta il tempo di calcolo. Su CPU è consigliato 'base' o 'small'.",
     )
     lang = st.selectbox(
         "Lingua",
         options=["auto", "it", "en", "fr", "de", "es", "pt"],
         index=0,
-        help="Se non sei sicuro, lascia **auto**.",
+        help="Se non sei sicuro, lascia 'auto'.",
     )
     beam_size = st.slider(
         "Beam size (ricerca frasi migliori)",
-        1, 10, 5, help="Valori più alti migliorano un po' l'accuratezza ma rallentano."
+        1, 10, 5,
+        help="Valori più alti migliorano un po' l'accuratezza ma rallentano."
     )
 
-# Preferenze rapide
 show_timestamps = st.checkbox(
     "Includi timestamp nei file di output (SRT)",
     value=False,
@@ -142,7 +117,7 @@ uploaded = st.file_uploader(
 start_btn = st.button("Avvia trascrizione", disabled=(uploaded is None))
 
 if uploaded and start_btn:
-    # Salva caricamento su disco (faster-whisper richiede un path)
+    # Salvataggio file
     with st.status("Preparazione file…", expanded=False) as status:
         tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded.name}")
         tmp_in.write(uploaded.read())
@@ -152,23 +127,15 @@ if uploaded and start_btn:
 
     # Caricamento modello
     t0 = time.time()
-    with st.status(
-        f"Caricamento modello **{model_name}** (compute_type: int8)…",
-        expanded=False
-    ) as status:
+    with st.status(f"Caricamento modello {model_name} (compute_type: int8)…", expanded=False) as status:
         try:
-            model = WhisperModel(model_name, compute_type="int8")  # CPU friendly
+            model = WhisperModel(model_name, compute_type="int8")
         except Exception as e:
             status.update(label="Errore nel caricamento del modello", state="error")
             st.error(f"Impossibile caricare il modello: {e}")
             os.unlink(tmp_in.name)
             st.stop()
-
-        elapsed = time.time() - t0
-        status.update(
-            label=f"Modello {model_name} pronto in {elapsed:0.2f}s",
-            state="complete"
-        )
+        status.update(label=f"Modello {model_name} pronto in {time.time()-t0:0.2f}s", state="complete")
 
     # Trascrizione
     st.subheader("Elaborazione")
@@ -184,19 +151,15 @@ if uploaded and start_btn:
             vad_filter=True,
         )
 
-        # Colleziona segmenti aggiornando progress (best-effort)
         segments = []
         last_update = time.time()
         for s in seg_gen:
             segments.append(s)
-            # throttle UI updates
-            if (time.time() - last_update) > 0.2 and info.duration:
-                # stima grezza progresso: fine segmento / durata
+            if (time.time() - last_update) > 0.2 and getattr(info, "duration", None):
                 p = min(1.0, s.end / max(1e-6, info.duration))
                 progress.progress(int(p * 100))
                 info_placeholder.info(
-                    f"Elaborazione… ~{int(p*100)}%  •  "
-                    f"segmenti: {len(segments)}  •  durata: {int(info.duration)}s"
+                    f"Elaborazione… ~{int(p*100)}%  •  segmenti: {len(segments)}  •  durata: {int(info.duration)}s"
                 )
                 last_update = time.time()
 
@@ -208,45 +171,6 @@ if uploaded and start_btn:
         os.unlink(tmp_in.name)
         st.stop()
     finally:
-        # libera il file di input
         try:
             os.unlink(tmp_in.name)
-        except Exception:
-            pass
-
-    # Costruisci output (testo grezzo e SRT)
-    raw_text, srt_text = segments_to_text_and_srt(segments)
-
-    # Miglioramento automatico se richiesto
-    final_text = tidy_text(raw_text) if auto_improve else raw_text
-
-    # Mostra testo
-    st.subheader("Trascrizione")
-    st.caption(
-        "Il testo mostrato qui sotto è già **pulito e formattato**"
-        " (se l'opzione era attiva)."
-    )
-    st.text_area("Testo", value=final_text, height=350, label_visibility="collapsed")
-
-    # Download
-    st.subheader("Download")
-
-    txt_path = save_bytes_for_download(final_text, ".txt")
-    st.download_button(
-        "Scarica TXT",
-        data=open(txt_path, "rb").read(),
-        file_name=os.path.splitext(uploaded.name)[0] + ".txt",
-        mime="text/plain",
-    )
-
-    if show_timestamps:
-        srt_path = save_bytes_for_download(srt_text, ".srt")
-        st.download_button(
-            "Scarica SRT (sottotitoli)",
-            data=open(srt_path, "rb").read(),
-            file_name=os.path.splitext(uploaded.name)[0] + ".srt",
-            mime="application/x-subrip",
-        )
-
-    # Info finali
-    st.info(
+        except Except
