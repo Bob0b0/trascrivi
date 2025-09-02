@@ -61,9 +61,7 @@ def convert_to_wav_with_progress(src_path: str, progress):
                 processed_sec = int(s.split("=")[1]) / 1_000_000.0
             except Exception:
                 processed_sec = processed_sec
-            # percentuale rispetto alla durata media (non alla velocità reale)
             pct_media = int(min(100, (processed_sec / max(1e-6, total_media)) * 100))
-            # stima realistica: velocità = media_elaborata / tempo_wall
             elapsed = max(1e-6, _t.time() - t0)
             rate = processed_sec / elapsed  # secondi di audio elaborati al secondo
             remaining = (max(0.0, total_media - processed_sec) / max(1e-6, rate))
@@ -129,8 +127,7 @@ if uploaded_file:
             frac = min(1.0, last_end / total_dur)
             pct = int(frac * 100)
             elapsed = time.time() - t0
-            # velocità relativa (frazione completata per secondo)
-            rate = max(1e-6, frac / max(1e-6, elapsed))
+            rate = max(1e-6, frac / max(1e-6, elapsed))  # frazione per secondo
             remaining = (1.0 - frac) / rate
             trans_bar.progress(pct, text=f"Trascrizione… {pct}%  • ETA ~ {fmt_hms(remaining)}")
 
@@ -139,7 +136,10 @@ if uploaded_file:
         text = "".join(s.text for s in segments).strip()
         srt_text = to_srt(segments)
 
-        st.success(f"Fatto! Durata: {info.duration:.1f}s – Segmenti: {len(segments)}")
+        # Durata in minuti e in mm:ss
+        dur_min = (info.duration or 0.0) / 60.0
+        dur_hms = fmt_hms(info.duration or 0.0)
+        st.success(f"Fatto! Durata: {dur_hms}  ({dur_min:.1f} min) – Segmenti: {len(segments)}")
         st.text_area("📝 Testo", text, height=300)
 
         c1, c2 = st.columns(2)
@@ -162,4 +162,4 @@ if uploaded_file:
         except Exception: pass
 
 else:
-    st.caption("Carica un file per iniziare. Durante conversione e trascrizione vedrai l'avanzamento e una stima del tempo residuo.")
+    st.caption("Carica un file per iniziare. Conversione e trascrizione mostrano ETA; la durata finale è in minuti e in formato mm:ss.")
