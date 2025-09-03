@@ -1,335 +1,321 @@
-# trascrizione.py
-# App Streamlit robusta per trascrizione audio con Faster-Whisper
-# - Precheck deterministico
-# - Conversione sicura a WAV 16 kHz mono
-# - Scelta modello automatica
-# - Messaggi d'errore chiari e download TXT/SRT
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+App Streamlit: Trascrizione audio (robusta) con split automatico se la durata supera il limite.
+- Nessuna dipendenza extra oltre a: streamlit, faster-whisper (già nel requirements), ffmpeg/ffprobe (da apt).
+- Se l'audio > MAX_MINUTES, lo dividiamo in blocchi CHUNK_MINUTES con OVERLAP_SECONDS di sovrapposizione.
+- Ogni blocco è convertito in WAV 16 kHz mono e trascritto; i timecode vengono riallineati e uniti.
+"""
+
+from __future__ import annotations
 
 import os
 import io
 import json
 import math
 import shutil
-import tempfile
 import subprocess
-from datetime import timedelta
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Iterable, Dict, Optional
 
 import streamlit as st
-from faster_whisper import WhisperModel
 
-# ------------------------ Configurazione ------------------------
+# opzionale: se presente, usiamo faster-whisper
+try:
+    from faster_whisper import WhisperModel
+except Exception as e:  # pragma: no cover
+    WhisperModel = None  # type: ignore
 
+
+# ==========================
+# Configurazione di base
+# ==========================
 APP_TITLE = "Trascrizione audio (robusta)"
-ALLOWED_EXTS = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma"]  # ffmpeg-friendly
+MAX_MINUTES = 60                  # limite hard dell'app (prima dello split)
+CHUNK_MINUTES_DEFAULT = 30        # durata blocchi generati quando si splitta
+OVERLAP_SECONDS_DEFAULT = 2       # sovrapposizione per evitare tagli di parole
+TARGET_SR = 16_000                # sample rate per la trascrizione
 
-# Limiti (sovrascrivibili via env)
-MAX_DURATION_S = int(os.getenv("MAX_DURATION_S", "3600"))   # max 60 min
-MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "200"))       # max 200 MB
+ALLOWED_EXT = [
+    "mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma"
+]
 
-# Modello/compute (override opzionale via env)
-ENV_MODEL_NAME   = os.getenv("WHISPER_MODEL", "auto")       # auto | tiny | base | small | medium | large-v3 | ecc.
-ENV_COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")        # int8 (CPU) di default
+# ==========================
+# Utility
+# ==========================
 
-# ------------------------ Utilità di sistema ------------------------
+def _run(cmd: List[str]) -> str:
+    """Esegue un comando e ritorna stdout come stringa (solleva eccezione in caso di errore)."""
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
 
-def which_or_error(bin_name: str):
-    path = shutil.which(bin_name)
-    if not path:
-        raise RuntimeError(f"'{bin_name}' non trovato nell'ambiente. Impossibile procedere.")
-    return path
 
-def available_mem_gb() -> float:
-    # Stima memoria disponibile senza dipendenze extra
+def check_ffmpeg() -> Dict[str, str]:
+    out = {}
     try:
-        pagesize = os.sysconf("SC_PAGE_SIZE")
-        av_pages = os.sysconf("SC_AVPHYS_PAGES")
-        return (pagesize * av_pages) / (1024 ** 3)
+        out["ffmpeg"] = _run(["ffmpeg", "-version"]).splitlines()[0]
     except Exception:
-        return 4.0  # fallback prudente
+        out["ffmpeg"] = "NON TROVATO"
+    try:
+        out["ffprobe"] = _run(["ffprobe", "-version"]).splitlines()[0]
+    except Exception:
+        out["ffprobe"] = "NON TROVATO"
+    return out
 
-def human_size(bytes_val: int) -> str:
-    if bytes_val is None:
-        return "N/D"
-    units = ["B","KB","MB","GB","TB"]
-    size = float(bytes_val)
-    for u in units:
-        if size < 1024.0:
-            return f"{size:.1f} {u}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
 
-def run_subprocess(cmd: list, check=False, capture=True, text=True):
-    return subprocess.run(
-        cmd,
-        check=check,
-        capture_output=capture,
-        text=text
-    )
+def ffprobe_duration_sec(path: str) -> float:
+    data = _run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "format=duration", "-of", "json", path
+    ])
+    dur = float(json.loads(data)["format"]["duration"])
+    return dur
 
-def ffprobe_json(path: str) -> dict:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration,bit_rate,size",
-        "-show_streams",
-        "-of", "json",
-        path
-    ]
-    res = run_subprocess(cmd)
-    if res.returncode != 0 or not res.stdout.strip():
-        raise ValueError("Impossibile leggere il file (ffprobe). File corrotto o formato non supportato.")
-    return json.loads(res.stdout)
 
-def pick_first_audio_stream(meta: dict):
-    for s in meta.get("streams", []):
-        if s.get("codec_type") == "audio":
-            return s
-    return None
-
-def s_to_srt_ts(t: float) -> str:
-    if t is None:
-        t = 0.0
-    if t < 0:
-        t = 0.0
-    ms = int(round(t * 1000))
-    h = ms // 3600000
-    ms = ms % 3600000
-    m = ms // 60000
-    ms = ms % 60000
-    s = ms // 1000
-    ms = ms % 1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-def build_srt(segments) -> str:
-    # segments: iter/seq di oggetti con .start .end .text
-    lines = []
-    for i, seg in enumerate(segments, 1):
-        start = s_to_srt_ts(seg["start"])
-        end   = s_to_srt_ts(seg["end"])
-        text  = (seg["text"] or "").strip()
-        lines.append(str(i))
-        lines.append(f"{start} --> {end}")
-        lines.append(text if text else "")
-        lines.append("")  # separatore blocchi
-    return "\n".join(lines).strip() + "\n"
-
-# ------------------------ Precheck & Conversione ------------------------
-
-def preflight_and_prepare(src_path: str):
-    which_or_error("ffmpeg")
-    which_or_error("ffprobe")
-
-    # 1) dimensione
-    size_bytes = os.path.getsize(src_path)
-    size_mb = size_bytes / (1024 * 1024)
-    if size_mb > MAX_SIZE_MB:
-        raise ValueError(f"File troppo grande ({size_mb:.1f} MB). Limite: {MAX_SIZE_MB} MB.")
-
-    # 2) lettura metadata + selezione stream audio
-    meta = ffprobe_json(src_path)
-    fmt = meta.get("format", {}) or {}
-    duration = float(fmt.get("duration") or 0.0)
-    if duration <= 0:
-        raise ValueError("Durata non rilevabile: file corrotto o non audio.")
-    if duration > MAX_DURATION_S:
-        raise ValueError(f"Audio troppo lungo ({duration/60:.0f} min). Limite: {MAX_DURATION_S/60:.0f} min.")
-
-    astream = pick_first_audio_stream(meta)
-    if not astream:
-        raise ValueError("Nessuno stream audio rilevato (file solo video/metadata o danneggiato).")
-
-    # 3) test di decodifica rapido (5s): intercetta corruzioni/codec problematici
-    test = run_subprocess(
-        ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-xerror",
-         "-t", "5", "-i", src_path, "-f", "null", "-"]
-    )
-    if test.returncode != 0:
-        msg = test.stderr.strip() or "Formato/codec non decodificabile."
-        raise ValueError(f"Decodifica fallita: {msg}")
-
-    # 4) conversione sicura → WAV PCM 16 kHz mono (rimuove metadati, video, sottotitoli, ecc.)
-    dst = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-    conv = run_subprocess(
-        ["ffmpeg", "-hide_banner", "-nostdin", "-y",
-         "-i", src_path,
-         "-map", "0:a:0",             # solo primo audio
-         "-map_metadata", "-1",       # nessun metadata
-         "-vn", "-sn", "-dn",         # no video/subs/data
-         "-ac", "1",                  # mono
-         "-ar", "16000",              # 16 kHz
-         "-acodec", "pcm_s16le",      # PCM 16bit
-         dst
+def split_audio(
+    in_path: str,
+    out_dir: str,
+    chunk_minutes: int = CHUNK_MINUTES_DEFAULT,
+    overlap_sec: int = OVERLAP_SECONDS_DEFAULT,
+    target_sr: int = TARGET_SR,
+) -> List[Dict[str, float | str]]:
+    """Divide l'audio in parti con una piccola sovrapposizione.
+    Ritorna una lista di dict: {path, start, end} per ciascun blocco.
+    """
+    dur = ffprobe_duration_sec(in_path)
+    chunk = chunk_minutes * 60
+    parts = []
+    start = 0.0
+    i = 1
+    while start < dur:
+        this_len = min(chunk + overlap_sec, dur - start)
+        out_path = str(Path(out_dir) / f"part_{i:03d}.wav")
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(start), "-i", in_path,
+            "-t", str(this_len),
+            "-ar", str(target_sr), "-ac", "1", "-c:a", "pcm_s16le",
+            out_path,
         ]
-    )
-    if conv.returncode != 0:
-        raise ValueError(f"Conversione audio fallita: {conv.stderr.strip()}")
+        subprocess.check_call(cmd)
+        parts.append({"path": out_path, "start": start, "end": start + this_len})
+        start += chunk  # l'offset globale NON include l'overlap
+        i += 1
+    return parts
 
-    # Report utile per UI
-    report = {
-        "original": {
-            "codec": astream.get("codec_name") or "n/d",
-            "sample_rate": astream.get("sample_rate") or "n/d",
-            "channels": astream.get("channels") or "n/d",
-            "bit_rate": fmt.get("bit_rate") or astream.get("bit_rate"),
-            "duration_s": duration,
-            "size": human_size(int(fmt.get("size") or size_bytes)),
-        },
-        "safe_wav": {
-            "path": dst,
-            "target": "WAV PCM s16le, mono, 16 kHz",
-        }
-    }
-    return dst, report
 
-# ------------------------ Modello ------------------------
+# ==========================
+# Trascrizione con faster-whisper
+# ==========================
 
-def select_model() -> dict:
-    # Se l'utente ha fissato un modello, rispettiamolo
-    if ENV_MODEL_NAME and ENV_MODEL_NAME.lower() != "auto":
-        return {"name": ENV_MODEL_NAME, "compute_type": ENV_COMPUTE_TYPE, "chunk_length": 20}
+@dataclass
+class Seg:
+    start: float
+    end: float
+    text: str
 
-    mem_gb = available_mem_gb()
-    if mem_gb < 2.0:
-        return {"name": "tiny",  "compute_type": "int8", "chunk_length": 10}
-    elif mem_gb < 4.0:
-        return {"name": "base",  "compute_type": "int8", "chunk_length": 15}
-    else:
-        # small è un buon compromesso su CPU; su GPU cambiare compute_type via env
-        return {"name": "small", "compute_type": ENV_COMPUTE_TYPE, "chunk_length": 20}
 
 @st.cache_resource(show_spinner=False)
-def get_model_cached(name: str, compute_type: str):
-    # Nota: download del modello la prima volta
-    return WhisperModel(
-        name,
-        compute_type=compute_type,   # es. "int8" su CPU
-        num_workers=1,
-        cpu_threads=max(2, (os.cpu_count() or 2) // 2),
-    )
+def load_model(model_name: str, compute_type: str):
+    if WhisperModel is None:
+        raise RuntimeError(
+            "La libreria 'faster-whisper' non è disponibile. Aggiungila a requirements.txt"
+        )
+    # device="auto": sceglie GPU se disponibile, altrimenti CPU
+    return WhisperModel(model_name, device="auto", compute_type=compute_type)
 
-def transcribe_wav(path: str, language_opt: str | None, cfg: dict):
-    model = get_model_cached(cfg["name"], cfg["compute_type"])
 
-    # Costruiamo il generatore e accumuliamo i segmenti per output TXT/SRT
-    segments_iter, info = model.transcribe(
-        path,
+def transcribe_file(
+    audio_path: str,
+    model_name: str = "small",
+    compute_type: str = "int8",
+    language: str | None = None,
+    beam_size: int = 5,
+) -> List[Seg]:
+    model = load_model(model_name, compute_type)
+    segments, info = model.transcribe(
+        audio_path,
+        language=language,
+        beam_size=beam_size,
         vad_filter=True,
-        chunk_length=cfg["chunk_length"],
-        beam_size=1,
-        temperature=0.0,
-        language=None if language_opt in (None, "auto") else language_opt,
-        task="transcribe",
     )
+    out: List[Seg] = []
+    for s in segments:  # type: ignore[attr-defined]
+        out.append(Seg(start=float(s.start), end=float(s.end), text=s.text.strip()))
+    return out
 
-    collected = []
-    for seg in segments_iter:
-        collected.append({
-            "start": float(seg.start or 0.0),
-            "end": float(seg.end or 0.0),
-            "text": seg.text.strip()
-        })
 
-    return collected, info  # info.language, info.duration, ecc.
+# ==========================
+# Formattazioni export
+# ==========================
 
-# ------------------------ UI ------------------------
+def _fmt_ts_srt(t: float) -> str:
+    if t < 0:
+        t = 0
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = int(t % 60)
+    ms = int(round((t - int(t)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-st.set_page_config(page_title=APP_TITLE, layout="centered")
+
+def segments_to_srt(segments: List[Seg]) -> str:
+    lines = []
+    for i, s in enumerate(segments, start=1):
+        lines.append(str(i))
+        lines.append(f"{_fmt_ts_srt(s.start)} --> {_fmt_ts_srt(s.end)}")
+        lines.append(s.text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def segments_to_vtt(segments: List[Seg]) -> str:
+    lines = ["WEBVTT", ""]
+    for s in segments:
+        a = _fmt_ts_srt(s.start).replace(",", ".")
+        b = _fmt_ts_srt(s.end).replace(",", ".")
+        lines.append(f"{a} --> {b}")
+        lines.append(s.text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def segments_to_text(segments: List[Seg]) -> str:
+    return " ".join(s.text for s in segments).strip()
+
+
+# ==========================
+# Interfaccia Streamlit
+# ==========================
+
+st.set_page_config(page_title=APP_TITLE, page_icon="🎧", layout="centered")
+
 st.title(APP_TITLE)
+st.caption("Carica un file audio. L'app esegue i controlli preliminari e solo se passa li trascrive.")
 
-with st.sidebar:
-    st.subheader("Impostazioni")
-    st.markdown("I file vengono **verificati** e **convertiti** prima della trascrizione, per evitare crash.")
-    st.caption(f"Limiti correnti — Durata: {MAX_DURATION_S//60} min · Dimensione: {MAX_SIZE_MB} MB")
-    language_opt = st.selectbox(
-        "Lingua forzata (opzionale)",
-        options=["auto","it","en","fr","de","es","pt","nl","sv","pl","ru","ja","zh"],
-        index=0,
-        help="Lascia 'auto' per rilevamento automatico."
-    )
-    st.divider()
-    st.caption("Modello/compute:")
-    cfg_preview = select_model()
-    st.code(f"model={cfg_preview['name']} · compute={cfg_preview['compute_type']} · chunk={cfg_preview['chunk_length']}s", language="bash")
-    st.caption("Override via env: WHISPER_MODEL, COMPUTE_TYPE")
+with st.expander("Controlli preliminari", expanded=True):
+    checks = check_ffmpeg()
+    col1, col2 = st.columns(2)
+    col1.write("ffmpeg:")
+    col1.code(checks.get("ffmpeg", ""))
+    col2.write("ffprobe:")
+    col2.code(checks.get("ffprobe", ""))
 
-st.markdown("Carica un **file audio**. L'app esegue i **controlli preliminari** e solo se passa li trascrive.")
+# Sidebar: opzioni
+st.sidebar.header("Opzioni")
+model_name = st.sidebar.selectbox("Modello", ["tiny", "base", "small", "medium"], index=2)
+compute_type = st.sidebar.selectbox("Precisione (CPU=consigliato int8)", ["int8", "int8_float16", "float16", "float32"], index=0)
+lang_opt = st.sidebar.selectbox("Lingua", ["auto (rileva)", "it", "en", "es", "fr", "de"], index=0)
+chunk_minutes = st.sidebar.number_input("Minuti per blocco (se split)", 10, 60, CHUNK_MINUTES_DEFAULT, 5)
+overlap_sec = st.sidebar.number_input("Sovrapposizione (s)", 0, 10, OVERLAP_SECONDS_DEFAULT, 1)
 
-uploaded = st.file_uploader("Seleziona un file", type=ALLOWED_EXTS, accept_multiple_files=False, label_visibility="visible")
+uploaded = st.file_uploader(
+    "Seleziona un file",
+    type=ALLOWED_EXT,
+    help="Limite 200MB per file • " + ", ".join(ext.upper() for ext in ALLOWED_EXT),
+)
 
 if uploaded is not None:
-    # Salvataggio in tmp
-    suffix = "." + (uploaded.name.split(".")[-1].lower() if "." in uploaded.name else "bin")
-    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=suffix).name
-    with open(tmp_in, "wb") as f:
-        f.write(uploaded.getbuffer())
+    # Salva il file su disco temporaneo
+    tmp_suffix = Path(uploaded.name).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=tmp_suffix) as tmp:
+        tmp.write(uploaded.read())
+        src_path = tmp.name
 
-    safe_wav = None
+    # Metadati e durata
     try:
-        # -------------------- PRECHECK --------------------
-        with st.status("Controlli preliminari in corso…", expanded=True) as status:
-            st.write("• Verifica presenza ffmpeg/ffprobe")
-            which_or_error("ffmpeg"); which_or_error("ffprobe")
-            st.write("• Lettura metadata e controlli di durata/dimensione")
-            safe_wav, report = preflight_and_prepare(tmp_in)
-            st.success("Precheck superato.")
-            status.update(label="Precheck completato", state="complete")
-
-        st.success("File accettato. Conversione sicura effettuata (WAV mono 16 kHz).")
-        with st.expander("Dettagli file"):
-            st.json(report)
-
-        # -------------------- TRASCRIZIONE --------------------
-        cfg = select_model()
-        with st.status(f"Caricamento modello '{cfg['name']}'…", expanded=False) as s:
-            _ = get_model_cached(cfg["name"], cfg["compute_type"])
-            s.update(label=f"Modello pronto: {cfg['name']} ({cfg['compute_type']})", state="complete")
-
-        with st.status("Trascrizione in corso…", expanded=True) as status:
-            st.write("• Avvio decodifica con VAD")
-            segs, info = transcribe_wav(safe_wav, language_opt, cfg)
-            st.write(f"• Rilevata lingua: **{info.language or 'auto'}**")
-            st.write(f"• Segmenti: **{len(segs)}**")
-            status.update(label="Trascrizione completata", state="complete")
-
-        # -------------------- OUTPUT --------------------
-        text_out = "\n".join(s["text"] for s in segs).strip()
-        srt_out = build_srt(segs)
-
-        st.subheader("Testo")
-        st.text_area("Trascrizione", value=text_out, height=240, label_visibility="collapsed")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "⬇️ Scarica TXT",
-                data=text_out.encode("utf-8"),
-                file_name=os.path.splitext(uploaded.name)[0] + ".txt",
-                mime="text/plain"
-            )
-        with col2:
-            st.download_button(
-                "⬇️ Scarica SRT",
-                data=srt_out.encode("utf-8"),
-                file_name=os.path.splitext(uploaded.name)[0] + ".srt",
-                mime="application/x-subrip"
-            )
-
+        duration_sec = ffprobe_duration_sec(src_path)
     except Exception as e:
-        st.error(f"Impossibile processare il file: {e}")
+        st.error(f"Impossibile leggere i metadata: {e}")
         st.stop()
-    finally:
-        # Pulizia file temporanei
-        try:
-            if safe_wav and os.path.exists(safe_wav):
-                os.unlink(safe_wav)
-        except Exception:
-            pass
-        try:
-            if tmp_in and os.path.exists(tmp_in):
-                os.unlink(tmp_in)
-        except Exception:
-            pass
 
-else:
-    st.info("Attendi selezione file. Formati consigliati: MP3, M4A/AAC, WAV, FLAC, OGG/Opus.")
+    duration_min = duration_sec / 60.0
 
+    st.info(f"Durata: **{duration_min:.1f} min** · Dimensione: **{uploaded.size/1_000_000:.1f} MB**")
 
+    # Se supera il limite, proponi split automatico
+    if duration_min > MAX_MINUTES:
+        st.error(f"Impossibile processare il file: Audio troppo lungo ({duration_min:.0f} min). Limite: {MAX_MINUTES} min.")
+        auto = st.checkbox(
+            f"Dividi automaticamente in blocchi da {chunk_minutes} min e procedi",
+            value=True,
+        )
+        if auto and st.button("Avvia frazionamento e trascrizione"):
+            with st.status("Divisione e trascrizione in corso...", expanded=True) as status:
+                with tempfile.TemporaryDirectory() as td:
+                    parts = split_audio(src_path, td, int(chunk_minutes), int(overlap_sec), TARGET_SR)
+                    st.write(f"Creati {len(parts)} blocchi")
+
+                    all_segments: List[Seg] = []
+                    for idx, p in enumerate(parts, start=1):
+                        st.write(f"• Trascrivo parte {idx}/{len(parts)}")
+                        segs = transcribe_file(
+                            p["path"],
+                            model_name=model_name,
+                            compute_type=compute_type,
+                            language=None if lang_opt.startswith("auto") else lang_opt,
+                        )
+                        # riallinea i timecode: offset globale = (indice-1) * chunk_minutes
+                        offset = (idx - 1) * int(chunk_minutes) * 60
+                        for s in segs:
+                            all_segments.append(Seg(start=s.start + offset, end=s.end + offset, text=s.text))
+
+                status.update(label="Merge completato", state="complete")
+
+            # Esporta
+            base = Path(uploaded.name).with_suffix("").name
+            srt = segments_to_srt(all_segments)
+            vtt = segments_to_vtt(all_segments)
+            txt = segments_to_text(all_segments)
+
+            st.subheader("Download")
+            st.download_button("Scarica .txt", txt, file_name=f"{base}.txt")
+            st.download_button("Scarica .srt", srt, file_name=f"{base}.srt")
+            st.download_button("Scarica .vtt", vtt, file_name=f"{base}.vtt")
+
+            st.subheader("Anteprima testo")
+            st.text_area("", txt, height=240)
+
+    else:
+        # Flusso normale (nessuno split)
+        if st.button("Trascrivi"):
+            with st.status("Trascrizione in corso...", expanded=True) as status:
+                # Converte direttamente in wav 16k mono temporaneo
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpwav:
+                    wav_path = tmpwav.name
+                subprocess.check_call([
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", src_path,
+                    "-ar", str(TARGET_SR), "-ac", "1", "-c:a", "pcm_s16le",
+                    wav_path,
+                ])
+                segs = transcribe_file(
+                    wav_path,
+                    model_name=model_name,
+                    compute_type=compute_type,
+                    language=None if lang_opt.startswith("auto") else lang_opt,
+                )
+                status.update(label="Trascrizione completata", state="complete")
+
+            base = Path(uploaded.name).with_suffix("").name
+            srt = segments_to_srt(segs)
+            vtt = segments_to_vtt(segs)
+            txt = segments_to_text(segs)
+
+            st.subheader("Download")
+            st.download_button("Scarica .txt", txt, file_name=f"{base}.txt")
+            st.download_button("Scarica .srt", srt, file_name=f"{base}.srt")
+            st.download_button("Scarica .vtt", vtt, file_name=f"{base}.vtt")
+
+            st.subheader("Anteprima testo")
+            st.text_area("", txt, height=240)
+
+# Footer minimale
+st.markdown(
+    """
+    <hr/>
+    <small>Se l'audio supera i 60 minuti, l'app esegue automaticamente lo split in blocchi (di default 30') con 2s di sovrapposizione e unisce i risultati mantenendo i timecode continui.</small>
+    """,
+    unsafe_allow_html=True,
+)
