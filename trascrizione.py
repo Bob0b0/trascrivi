@@ -135,10 +135,7 @@ def build_vtt(segments: List[Segment]) -> str:
 
 
 def make_ai_prompt(lang_hint: str = "italiano") -> str:
-    """
-    Prompt suggerito per post-processing con un LLM esterno.
-    (Niente chiamate esterne: lo mostriamo solo per il copia/incolla)
-    """
+    """Prompt suggerito per post-processing con un LLM esterno (per copia/incolla)."""
     return textwrap.dedent(f"""
     Migliora il seguente testo trascritto da audio, **senza inventare contenuti**.
 
@@ -160,6 +157,24 @@ def make_ai_prompt(lang_hint: str = "italiano") -> str:
     """).strip()
 
 
+# ============================ Cache modello ============================
+
+@st.cache_resource(show_spinner=False)
+def load_model_cached(model_size: str, compute_type: str) -> WhisperModel:
+    """
+    Carica (e cache) il modello. Forziamo local_files_only=False per consentire
+    il download la prima volta. Impostiamo anche una cartella cache stabile.
+    """
+    download_root = os.path.expanduser("~/.cache/faster_whisper")
+    os.makedirs(download_root, exist_ok=True)
+    return WhisperModel(
+        model_size,
+        compute_type=compute_type,
+        local_files_only=False,           # <-- fix per l'errore visto
+        download_root=download_root,
+    )
+
+
 # ============================ Trascrizione con Faster-Whisper ============================
 
 def run_transcription(
@@ -175,15 +190,11 @@ def run_transcription(
       raw_text, tidy, srt, vtt, segments, duration, detected_language
     """
     with status_area.status("Carico il modello…"):
-        model = WhisperModel(
-            model_size,
-            compute_type=compute_type,
-        )
+        model = load_model_cached(model_size, compute_type)
 
     duration = get_media_duration(file_path) or 0.0
 
     with status_area.status("Trascrivo…"):
-        # generator di segmenti
         segments_gen, info = model.transcribe(
             file_path,
             language=None if language == "auto" else language,
@@ -196,7 +207,6 @@ def run_transcription(
         segments: List[Segment] = []
         raw_parts: List[str] = []
 
-        # Se abbiamo una durata, proviamo una progress bar “proporzionale”
         prog = st.progress(0.0) if duration > 0 else None
         last_end = 0.0
 
@@ -402,8 +412,6 @@ if start and uploaded is not None:
             status_area=status_area
         )
 
-        # Revisione/impaginazione sono già applicate (tidy_text + wrap)
-        # raw resta disponibile se mai servisse.
         results = {
             "filename": uploaded.name,
             "stem": stem,
@@ -428,6 +436,8 @@ if start and uploaded is not None:
     except Exception as e:
         st.error("Si è verificato un errore durante l'elaborazione.")
         st.exception(e)
+        st.info("Se vedi un errore tipo 'LocalEntryNotFoundError', significa che il modello non era in cache e il download è stato bloccato. "
+                "Riprova più tardi o verifica che l'accesso a Internet dell'app sia consentito.")
     finally:
         # Pulisci file temporaneo
         try:
@@ -435,7 +445,3 @@ if start and uploaded is not None:
         except Exception:
             pass
         st.session_state["processing"] = False
-
-       
-
-  
