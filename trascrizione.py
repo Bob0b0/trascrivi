@@ -201,7 +201,7 @@ with st.sidebar:
     st.subheader("Impostazioni")
     model_size = st.selectbox(
         "Modello Whisper",
-        options=["tiny", "base", "small", "medium", "large-v3"],
+        options=["tiny", "base", "small", "medium"],
         index=0,
         help="Usa 'tiny' per test veloci; modelli maggiori = più qualità, più lenti."
     )
