@@ -5,19 +5,14 @@
 # - Barra di avanzamento per ogni blocco (tempo totale → residuo stimato)
 # - Salvataggio incrementale e persistenza .txt per tutta la sessione
 # - Guida rapida + lettura README.md
-# - Prompt di post-produzione con testo inserito automaticamente
+# - Prompt di post-produzione SOLO in sidebar (persistente in sessione)
 
 from __future__ import annotations
 
 import os
-import io
 import re
-import math
 import time
 import json
-import shutil
-import string
-import random
 import threading
 import tempfile
 from datetime import datetime
@@ -40,15 +35,15 @@ DEFAULT_MODEL = "tiny"  # tiny/base/small/medium/large-v3 ecc.
 # Overlap tra blocchi per non troncare frasi
 CHUNK_OVERLAP_SECONDS = 10.0
 
-# Cartella per-sessione dove salviamo i file (persiste finché la sessione resta viva)
+# Cartella per-sessione e indice file salvati
 SESSION_DIR_KEY = "workdir"
 TRANSCRIPTS_INDEX_KEY = "saved_transcripts"
+LAST_PROMPT_KEY = "last_prompt"   # prompt completo in sessione
 
 
 # ============ UTILS ============
 def _ensure_session_dir() -> str:
     if SESSION_DIR_KEY not in st.session_state:
-        # cartella temporanea unica per la sessione utente
         sess_dir = tempfile.mkdtemp(prefix="trascrivi_")
         st.session_state[SESSION_DIR_KEY] = sess_dir
     return st.session_state[SESSION_DIR_KEY]
@@ -78,7 +73,6 @@ def _read_text(path: str) -> str:
 def _probe_duration_seconds(path: str) -> float:
     """Rileva durata audio in secondi usando ffprobe."""
     meta = ffmpeg.probe(path)
-    # Preferisci stream audio; altrimenti prendi la durata del formato
     dur = None
     for s in meta.get("streams", []):
         if s.get("codec_type") == "audio" and "duration" in s:
@@ -112,13 +106,11 @@ def _compute_chunk_plan(total_sec: float) -> List[Tuple[float, float]]:
 
 
 def _slice_to_wav(src_path: str, dst_path: str, start_sec: float, dur_sec: float):
-    """
-    Crea un WAV mono 16 kHz della finestra richiesta.
-    """
+    """Crea un WAV mono 16 kHz della finestra richiesta."""
     (
         ffmpeg
         .input(src_path, ss=start_sec, t=dur_sec)
-        .output(dst_path, ac=1, ar=16000, format="wav", y="-y")  # mono 16k
+        .output(dst_path, ac=1, ar=16000, format="wav", y="-y")
         .overwrite_output()
         .run(quiet=True)
     )
@@ -126,20 +118,20 @@ def _slice_to_wav(src_path: str, dst_path: str, start_sec: float, dur_sec: float
 
 def _estimate_eta_text(total_s: float, elapsed_s: float) -> str:
     remain = max(0.0, total_s - elapsed_s)
+
     def fmt(s: float) -> str:
         m, s = divmod(int(round(s)), 60)
         h, m = divmod(m, 60)
         if h > 0:
             return f"{h:02d}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
+
     return f"Totale stimato: {fmt(total_s)} • Residuo: {fmt(remain)}"
 
 
 def _collect_segments_text(segments) -> str:
-    # segments è un generatore; concateno il testo
     parts = []
     for seg in segments:
-        # seg.text è già con spazio iniziale; uniformiamo
         parts.append(seg.text)
     return "".join(parts)
 
@@ -183,7 +175,7 @@ with st.expander("📌 Guida rapida", expanded=True):
 - L'audio viene diviso **automaticamente** in blocchi da **10–12 min** con una piccola sovrapposizione.
 - Per **ogni blocco** vedi una barra di avanzamento con **stima del tempo residuo**.
 - Il `.txt` viene **salvato dopo ogni blocco** e rimane disponibile finché **la sessione resta aperta**.
-- A fine lavoro trovi il **prompt per AI** con dentro **la trascrizione** già inserita, pronto da copiare.
+- Il **prompt per AI** comparirà **in sidebar** con dentro **la trascrizione** già inserita.
         """
     )
 
@@ -221,22 +213,45 @@ with st.sidebar:
     _init_transcripts_index()
     if st.session_state[TRANSCRIPTS_INDEX_KEY]:
         for label, path in list(st.session_state[TRANSCRIPTS_INDEX_KEY].items()):
-            with open(path, "r", encoding="utf-8") as f:
-                data = f.read()
-            st.download_button(
-                label=f"⬇️ Scarica {label}",
-                data=data,
-                file_name=os.path.basename(path),
-                mime="text/plain",
-                key=f"dl_{label}"
-            )
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = f.read()
+                st.download_button(
+                    label=f"⬇️ Scarica {label}",
+                    data=data,
+                    file_name=os.path.basename(path),
+                    mime="text/plain",
+                    key=f"dl_{label}"
+                )
+            except Exception:
+                st.caption(f"(Non riesco a leggere {label})")
     else:
         st.caption("Nessun file salvato in questa sessione.")
 
+    # Prompt per AI (persistente in sessione)
+    st.markdown("---")
+    st.markdown("### Prompt per AI")
+    prompt_sidebar_val = st.session_state.get(LAST_PROMPT_KEY, "")
+    if prompt_sidebar_val:
+        st.text_area(
+            "Prompt completo (con testo inserito)",
+            value=prompt_sidebar_val,
+            height=260,
+            key="prompt_sidebar",
+        )
+        st.download_button(
+            "⬇️ Scarica prompt_AI.txt",
+            data=prompt_sidebar_val,
+            file_name="prompt_AI.txt",
+            mime="text/plain",
+            key="dl_prompt",
+        )
+    else:
+        st.caption("Il prompt apparirà qui al termine (o in caso di salvataggi parziali).")
+
     st.markdown("---")
     if st.button("🔁 Reimposta sessione (non cancella file locali già scaricati)"):
-        # Non cancelliamo la cartella su disco; azzeriamo solo lo stato
-        for k in [TRANSCRIPTS_INDEX_KEY, SESSION_DIR_KEY]:
+        for k in [TRANSCRIPTS_INDEX_KEY, SESSION_DIR_KEY, LAST_PROMPT_KEY]:
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
@@ -269,7 +284,6 @@ if uploaded is not None:
 
     chunks = _compute_chunk_plan(total_sec)
     n_chunks = len(chunks)
-    # Anteprima piano di lavorazione
     avg_chunk_min = sum(d for _, d in chunks) / n_chunks / 60.0 if n_chunks else 0
     st.success(
         f"L'audio durerà **{total_sec/60:.1f} min**. "
@@ -306,11 +320,7 @@ if uploaded is not None:
         overall_bar = overall_box.progress(0.0, text="Avanzamento complessivo…")
         overall_eta = overall_box.empty()
 
-        # statistiche per ETA
-        # rtf_inv = secondi_di_calcolo / secondi_audio
         rolling_rtf_inv: List[float] = []
-
-        # Trascrizione per blocchi
         accumulated_text = []
 
         for i, (start_sec, dur_sec) in enumerate(chunks, start=1):
@@ -328,15 +338,14 @@ if uploaded is not None:
                 st.error(f"Errore nel pre-processing del blocco {i}: {e}")
                 break
 
-            # Stima tempo totale atteso per questo blocco (in base ai blocchi già fatti)
+            # Stima tempo blocco
             if rolling_rtf_inv:
                 avg_inv = sum(rolling_rtf_inv) / len(rolling_rtf_inv)
                 expected_total_s = max(3.0, dur_sec * avg_inv)
             else:
-                # prima stima conservativa (fattore tempo 0.6x realtime ≈ rtf_inv 1.7)
                 expected_total_s = max(3.0, dur_sec * 1.7)
 
-            # Esegui transcribe in un thread per poter aggiornare la barra nel frattempo
+            # Transcribe in thread
             done_evt = threading.Event()
             result_holder = {"text": "", "elapsed": 0.0, "error": None}
 
@@ -360,11 +369,10 @@ if uploaded is not None:
             th = threading.Thread(target=_worker, daemon=True)
             th.start()
 
-            # Aggiorna la barra durante l'elaborazione (tempo stimato → residuo)
+            # Aggiorna barra
             t_loop0 = time.time()
             while not done_evt.is_set():
                 elapsed = time.time() - t_loop0
-                # Evita di arrivare a 100% prima del termine
                 frac = min(0.95, elapsed / expected_total_s)
                 chunk_bar.progress(frac)
                 chunk_eta.markdown(_estimate_eta_text(expected_total_s, elapsed))
@@ -373,10 +381,15 @@ if uploaded is not None:
             # Concluso il blocco
             if result_holder["error"] is not None:
                 st.error(f"Errore nel blocco {i}: {result_holder['error']}")
-                # Salva quanto prodotto finora comunque
                 if accumulated_text:
                     try:
                         _append_text(out_txt_path, "".join(accumulated_text))
+                        # aggiorna prompt parziale in sidebar
+                        try:
+                            partial = _read_text(out_txt_path)
+                            st.session_state[LAST_PROMPT_KEY] = _make_prompt_with_text(partial)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 break
@@ -392,12 +405,17 @@ if uploaded is not None:
             accumulated_text.append(result_holder["text"])
             try:
                 _append_text(out_txt_path, result_holder["text"])
+                # aggiorna prompt parziale in sidebar dopo ogni blocco
+                try:
+                    partial = _read_text(out_txt_path)
+                    st.session_state[LAST_PROMPT_KEY] = _make_prompt_with_text(partial)
+                except Exception:
+                    pass
             except Exception as e:
                 chunk_log.warning(f"Avviso: impossibile salvare incrementale (blocco {i}): {e}")
 
-            # Aggiorna barra complessiva e ETA complessiva
+            # Barra complessiva / ETA job
             overall_frac = i / n_chunks
-            # Stima restante: somma durazioni restanti * avg_inv
             if rolling_rtf_inv:
                 avg_inv = sum(rolling_rtf_inv) / len(rolling_rtf_inv)
                 remaining_audio_s = sum(d for _, d in chunks[i:])  # i è 1-based
@@ -421,10 +439,8 @@ if uploaded is not None:
                 type="primary",
             )
 
-            st.subheader("4) Prompt per AI (con testo inserito)")
-            prompt_full = _make_prompt_with_text(final_text)
-            st.text_area("Copia e incolla nella tua AI preferita", value=prompt_full, height=320)
-
+            # Prepara prompt definitivo SOLO per la sidebar
+            st.session_state[LAST_PROMPT_KEY] = _make_prompt_with_text(final_text)
         else:
             st.error("La trascrizione non è stata generata.")
 else:
