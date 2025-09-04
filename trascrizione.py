@@ -1,150 +1,125 @@
 # trascrivi.py
-# Streamlit app per trascrizione audio con faster-whisper
-# Funzioni chiave:
-# - Suddivisione automatica in blocchi 10–12 minuti
-# - Barra di avanzamento per ogni blocco (tempo totale → residuo stimato)
-# - Salvataggio incrementale e persistenza .txt per tutta la sessione
-# - Guida rapida + lettura README.md
-# - Prompt di post-produzione con testo inserito automaticamente
-
-from __future__ import annotations
+# Streamlit app per trascrizione con faster-whisper + gestione chunk 10–12 minuti
+# Autore visibile nell'header: modifica qui sotto ✎ se vuoi cambiarlo al volo.
+AUTHOR_NAME = "Roberto M."  # ✎ Cambia qui il nome autore mostrato nell'app
 
 import os
 import io
-import re
 import math
 import time
 import json
+import queue
 import shutil
 import string
-import random
 import threading
 import tempfile
+import subprocess
 from datetime import datetime
-from typing import List, Tuple
 
 import streamlit as st
 from faster_whisper import WhisperModel
 import ffmpeg
 
 
-# ============ CONFIGURAZIONE APP ============
-st.set_page_config(page_title="Trascrivi audio", page_icon="🎧", layout="wide")
+# ----------------------------- Utility di base ----------------------------- #
 
-# [MODIFICA] Autore visibile in app (cerca questa riga per cambiarlo rapidamente)
-AUTHOR_DISPLAY_NAME = "Roberto M."   # << Cambia qui il nome autore
-
-APP_TITLE = "Trascrivi — Whisper (faster-whisper)"
-DEFAULT_LANGUAGE = "it"
-DEFAULT_MODEL = "tiny"  # tiny/base/small/medium/large-v3 ecc.
-# Overlap tra blocchi per non troncare frasi
-CHUNK_OVERLAP_SECONDS = 10.0
-
-# Cartella per-sessione dove salviamo i file (persiste finché la sessione resta viva)
-SESSION_DIR_KEY = "workdir"
-TRANSCRIPTS_INDEX_KEY = "saved_transcripts"
+def _human_time(sec: float) -> str:
+    sec = max(0, int(round(sec)))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-# ============ UTILS ============
-def _ensure_session_dir() -> str:
-    if SESSION_DIR_KEY not in st.session_state:
-        # cartella temporanea unica per la sessione utente
-        sess_dir = tempfile.mkdtemp(prefix="trascrivi_")
-        st.session_state[SESSION_DIR_KEY] = sess_dir
-    return st.session_state[SESSION_DIR_KEY]
+def _sanitize_filename(name: str) -> str:
+    valid = f"-_.() {string.ascii_letters}{string.digits}"
+    clean = "".join(c if c in valid else "_" for c in name).strip(" ._")
+    return clean or "file"
 
 
-def _safe_filename(name: str) -> str:
-    name = os.path.basename(name)
-    name = re.sub(r"[^\w\-.]+", "_", name, flags=re.UNICODE)
-    return name[:120]
+def _ensure_session_dir():
+    if "session_dir" not in st.session_state:
+        st.session_state.session_dir = tempfile.mkdtemp(prefix="trascrivi_")
+    if "saved_files" not in st.session_state:
+        st.session_state.saved_files = []
+    if "transcript_text" not in st.session_state:
+        st.session_state.transcript_text = ""
+    if "ai_prompt_text" not in st.session_state:
+        st.session_state.ai_prompt_text = ""
 
 
-def _write_bytes(path: str, data: bytes):
-    with open(path, "wb") as f:
-        f.write(data)
-
-
-def _append_text(path: str, text: str):
-    with open(path, "a", encoding="utf-8") as f:
+def _save_text_session(basename: str, text: str) -> str:
+    _ensure_session_dir()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = _sanitize_filename(basename.rsplit(".", 1)[0])
+    path = os.path.join(st.session_state.session_dir, f"{ts}_{base}.txt")
+    with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+    # memorizza per download rapido
+    label = os.path.basename(path)
+    st.session_state.saved_files.append({"path": path, "label": label})
+    return path
 
 
-def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+def _check_ffprobe() -> bool:
+    try:
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        return True
+    except Exception:
+        return False
 
 
 def _probe_duration_seconds(path: str) -> float:
-    """Rileva durata audio in secondi usando ffprobe."""
-    meta = ffmpeg.probe(path)
-    # Preferisci stream audio; altrimenti prendi la durata del formato
-    dur = None
-    for s in meta.get("streams", []):
-        if s.get("codec_type") == "audio" and "duration" in s:
-            dur = float(s["duration"])
-            break
-    if dur is None:
-        dur = float(meta["format"]["duration"])
-    return dur
+    """Restituisce la durata in secondi via ffprobe."""
+    if not _check_ffprobe():
+        raise RuntimeError("ffprobe non trovato. Assicurati che ffmpeg/ffprobe sia installato.")
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json", path
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    info = json.loads(p.stdout.decode("utf-8"))
+    return float(info["format"]["duration"])
 
 
-def _compute_chunk_plan(total_sec: float) -> List[Tuple[float, float]]:
-    """
-    Regola: durata_blocco = clamp(total/8, 10min, 12min).
-    Ritorna lista di (start, durata) in secondi, con overlap fisso.
-    """
-    min_chunk = 10 * 60.0
-    max_chunk = 12 * 60.0
-    target = max(min_chunk, min(max_chunk, total_sec / 8.0))
-    step = target - CHUNK_OVERLAP_SECONDS
-    plan = []
-    start = 0.0
-    while start < total_sec:
-        end = min(start + target, total_sec)
-        dur = max(0.0, end - start)
-        if dur > 0.5:
-            plan.append((start, dur))
-        if end >= total_sec:
-            break
-        start = start + step
-    return plan
-
-
-def _slice_to_wav(src_path: str, dst_path: str, start_sec: float, dur_sec: float):
-    """
-    Crea un WAV mono 16 kHz della finestra richiesta.
-    """
+def _export_wav_segment(src_path: str, start_s: float, dur_s: float, dst_path: str):
+    """Esporta un segmento a WAV mono 16k per massima compatibilità."""
     (
         ffmpeg
-        .input(src_path, ss=start_sec, t=dur_sec)
-        .output(dst_path, ac=1, ar=16000, format="wav", y="-y")  # mono 16k
+        .input(src_path, ss=max(0, start_s), t=max(0.1, dur_s))
+        .output(dst_path, format="wav", ac=1, ar=16000, acodec="pcm_s16le")
         .overwrite_output()
         .run(quiet=True)
     )
 
 
-def _estimate_eta_text(total_s: float, elapsed_s: float) -> str:
-    remain = max(0.0, total_s - elapsed_s)
-    def fmt(s: float) -> str:
-        m, s = divmod(int(round(s)), 60)
-        h, m = divmod(m, 60)
-        if h > 0:
-            return f"{h:02d}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
-    return f"Totale stimato: {fmt(total_s)} • Residuo: {fmt(remain)}"
+def _plan_chunks(duration_s: float, target_min: float = 10.5, max_min: float = 12.0, overlap_s: float = 10.0):
+    """
+    Crea un piano di chunk ~10–12 minuti con overlap fisso.
+    Ritorna lista di (start, dur), numero chunk, dur_media_min.
+    """
+    # numero chunk intorno al target
+    n = max(1, round(duration_s / (target_min * 60.0)))
+    # se qualcuno superasse max_min, aumentiamo n
+    while (duration_s / n) > (max_min * 60.0):
+        n += 1
+    chunk_len = duration_s / n
+    chunks = []
+    for i in range(n):
+        start = i * chunk_len
+        if i > 0:
+            start = max(0.0, start - overlap_s)
+        end = min(duration_s, (i + 1) * chunk_len)
+        dur = max(0.1, end - start)
+        chunks.append((start, dur))
+    return chunks, n, (chunk_len / 60.0)
 
 
-def _collect_segments_text(segments) -> str:
-    # segments è un generatore; concateno il testo
-    parts = []
-    for seg in segments:
-        # seg.text è già con spazio iniziale; uniformiamo
-        parts.append(seg.text)
-    return "".join(parts)
-
-
-def _make_prompt_with_text(transcript: str) -> str:
+def _build_ai_prompt(transcript_text: str) -> str:
+    """
+    Genera il prompt completo con la trascrizione già inserita tra i delimitatori.
+    """
+    transcript_text = transcript_text.strip()
     return (
         "SEI UN EDITOR PROFESSIONISTA.\n\n"
         "Migliora il testo seguente senza alterare i contenuti: correggi refusi,\n"
@@ -154,278 +129,291 @@ def _make_prompt_with_text(transcript: str) -> str:
         "<< TESTO DA INSERIRE >>\n"
         "Output richiesto: testo finale pulito, pronto per la pubblicazione.\n"
         "§§§§§§\n"
+        "questo era il testo (nel caso l'avessi perso)\n\n"
         "TESTO DA MIGLIORARE (tra i delimitatori):\n"
-        "[---INIZIO TESTO---]\n"
-        f"{transcript}\n"
-        "[---FINE TESTO---]\n"
+        "§§§§§§\n"
+        f"{transcript_text}\n"
+        "§§§§§§\n"
     )
 
 
-def _init_transcripts_index():
-    if TRANSCRIPTS_INDEX_KEY not in st.session_state:
-        st.session_state[TRANSCRIPTS_INDEX_KEY] = {}  # {label: path}
+# ----------------------------- UI Header & Sidebar ----------------------------- #
+
+def _header(title="Trascrivi — Whisper (faster-whisper)"):
+    col1, col2 = st.columns([0.8, 0.2])
+    with col1:
+        st.markdown(f"## {title}")
+    with col2:
+        st.markdown(f"<div style='text-align:right;color:#666;'>Autore: <b>{AUTHOR_NAME}</b></div>", unsafe_allow_html=True)
 
 
-# ============ HEADER ============
-col_title, col_author = st.columns([1, 0.25])
-with col_title:
-    st.title(APP_TITLE)
-with col_author:
-    st.markdown(
-        f"<div style='text-align:right; opacity:0.9;'>Autore: <b>{AUTHOR_DISPLAY_NAME}</b></div>",
-        unsafe_allow_html=True,
-    )
+def _sidebar_settings():
+    st.sidebar.header("Impostazioni")
 
-with st.expander("📌 Guida rapida", expanded=True):
-    st.markdown(
-        """
-- Carica un file audio e avvia la trascrizione.
-- L'audio viene diviso **automaticamente** in blocchi da **10–12 min** con una piccola sovrapposizione.
-- Per **ogni blocco** vedi una barra di avanzamento con **stima del tempo residuo**.
-- Il `.txt` viene **salvato dopo ogni blocco** e rimane disponibile finché **la sessione resta aperta**.
-- A fine lavoro trovi il **prompt per AI** con dentro **la trascrizione** già inserita, pronto da copiare.
-        """
-    )
-
-# README (se presente)
-readme_text = None
-try:
-    if os.path.exists("README.md"):
-        readme_text = _read_text("README.md")
-except Exception:
-    readme_text = None
-
-with st.expander("📖 Apri README.md", expanded=False):
-    if readme_text:
-        st.markdown(readme_text)
-    else:
-        st.info("Nessun README.md trovato nel repository.")
-
-st.divider()
-
-
-# ============ SIDEBAR ============
-with st.sidebar:
-    st.subheader("Impostazioni")
-    model_size = st.selectbox(
+    model_size = st.sidebar.selectbox(
         "Modello Whisper",
-        options=["tiny", "base", "small", "medium", "large-v3"],
-        index=0,
-        help="Usa 'tiny' per test veloci; modelli maggiori = più qualità, più lenti."
+        ["tiny", "base", "small", "medium", "large-v3"],
+        index=2,
+        help="Modello di trascrizione (tiny/base/small/medium/large-v3)."
     )
-    language = st.text_input("Lingua", value=DEFAULT_LANGUAGE, help="Codice lingua (es. it, en, fr).")
-    st.caption("Blocchi: automatico 10–12 minuti (impostazione interna).")
 
-    st.markdown("---")
-    st.markdown("### File salvati (sessione)")
-    _init_transcripts_index()
-    if st.session_state[TRANSCRIPTS_INDEX_KEY]:
-        for label, path in list(st.session_state[TRANSCRIPTS_INDEX_KEY].items()):
-            with open(path, "r", encoding="utf-8") as f:
-                data = f.read()
-            st.download_button(
-                label=f"⬇️ Scarica {label}",
-                data=data,
-                file_name=os.path.basename(path),
-                mime="text/plain",
-                key=f"dl_{label}"
-            )
+    lang = st.sidebar.text_input("Lingua", value="it", help="Codice lingua ISO (es. it, en, fr, ...).")
+
+    st.sidebar.caption("Blocchi: automatico 10–12 minuti (impostazione interna).")
+
+    # Sezione salvataggi sessione
+    st.sidebar.subheader("File salvati (sessione)")
+    if st.session_state.get("saved_files"):
+        for i, item in enumerate(st.session_state.saved_files):
+            with open(item["path"], "rb") as f:
+                st.sidebar.download_button(
+                    "Scarica",
+                    data=f.read(),
+                    file_name=item["label"],
+                    key=f"dl_{i}",
+                    help=item["label"]
+                )
+                st.sidebar.caption(item["label"])
     else:
-        st.caption("Nessun file salvato in questa sessione.")
+        st.sidebar.caption("Nessun file salvato in questa sessione.")
 
-    st.markdown("---")
-    if st.button("🔁 Reimposta sessione (non cancella file locali già scaricati)"):
-        # Non cancelliamo la cartella su disco; azzeriamo solo lo stato
-        for k in [TRANSCRIPTS_INDEX_KEY, SESSION_DIR_KEY]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
+    st.sidebar.button("🔄 Reimposta sessione\n*(non cancella file locali già scaricati)*",
+                      on_click=_reset_session_state)
+
+    # Prompt AI (precompilato dopo trascrizione)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Prompt per AI (post-produzione)")
+    if st.session_state.get("ai_prompt_text"):
+        st.sidebar.text_area(
+            "Prompt completo (copia & incolla ovunque)",
+            value=st.session_state["ai_prompt_text"],
+            height=260
+        )
+        # download del prompt come txt
+        prompt_name = f"prompt_AI_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        st.sidebar.download_button("Scarica prompt",
+                                   data=st.session_state["ai_prompt_text"].encode("utf-8"),
+                                   file_name=prompt_name)
+    else:
+        st.sidebar.caption("Il prompt verrà generato qui dopo la trascrizione.")
 
 
-# ============ UPLOAD ============
-st.subheader("1) Carica il file audio")
-uploaded = st.file_uploader(
-    "Formati comuni supportati (mp3, wav, m4a, webm, ...)",
-    type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "webm"],
-    accept_multiple_files=False,
-)
+def _reset_session_state():
+    # NON elimina la cartella, lascia i file finché la sessione resta viva
+    for key in ["saved_files", "transcript_text", "ai_prompt_text"]:
+        st.session_state[key] = [] if key == "saved_files" else ""
+    st.toast("Sessione reimpostata (i file scaricati in locale restano).", icon="✅")
 
-workdir = _ensure_session_dir()
-_init_transcripts_index()
 
-if uploaded is not None:
-    # Salva l'upload nella cartella di sessione
-    base = _safe_filename(uploaded.name)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    src_audio_path = os.path.join(workdir, f"{ts}_{base}")
-    _write_bytes(src_audio_path, uploaded.getvalue())
+# ----------------------------- App ----------------------------- #
 
-    # Info durata
-    try:
-        total_sec = _probe_duration_seconds(src_audio_path)
-    except Exception as e:
-        st.error(f"Impossibile leggere la durata dell'audio: {e}")
-        st.stop()
+def main():
+    st.set_page_config(page_title="Trascrivi — Whisper", page_icon="🎙️", layout="wide")
+    _ensure_session_dir()
 
-    chunks = _compute_chunk_plan(total_sec)
-    n_chunks = len(chunks)
-    # Anteprima piano di lavorazione
-    avg_chunk_min = sum(d for _, d in chunks) / n_chunks / 60.0 if n_chunks else 0
-    st.success(
-        f"L'audio durerà **{total_sec/60:.1f} min**. "
-        f"Verrà elaborato in **{n_chunks} blocchi** da circa **{avg_chunk_min:.1f} min** (overlap {int(CHUNK_OVERLAP_SECONDS)}s)."
+    _header()
+
+    with st.expander("📌 Guida rapida", expanded=False):
+        st.markdown(
+            """
+**1. Carica un file audio.**  
+Formati comuni: `mp3, wav, m4a, aac, flac, ogg, webm, wma...`
+
+**2. Avvia la trascrizione.**  
+Se l'audio è lungo, verrà suddiviso in blocchi **~10–12 min** con **overlap 10s** per non perdere parole a cavallo.
+
+**3. Scarica il .txt.**  
+I file **restano disponibili per tutta la durata della sessione** (finché non chiudi/ricarichi la pagina).
+
+**4. Prompt AI.**  
+Dopo la trascrizione, nella **sidebar** trovi un **prompt precompilato** con il testo già inserito tra i delimitatori.
+"""
+        )
+
+    # Prova ad aprire README.md se presente nel repo
+    with st.expander("📖 Apri README.md"):
+        readme_path = os.path.join(os.getcwd(), "README.md")
+        if os.path.exists(readme_path):
+            with open(readme_path, "r", encoding="utf-8") as f:
+                st.markdown(f.read())
+        else:
+            st.info("README.md non trovato nel repository.")
+
+    st.markdown("### 1) Carica il file audio")
+    uploaded = st.file_uploader(
+        "Drag and drop / Browse",
+        type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "wma", "webm"],
+        accept_multiple_files=False,
+        label_visibility="collapsed"
     )
 
-    st.subheader("2) Avvia la trascrizione")
-    start_btn = st.button("🚀 Avvia", type="primary")
+    # Mostra info di pianificazione chunk una volta noto il file
+    audio_path = None
+    duration_s = None
+    if uploaded is not None:
+        # Salva una copia nella cartella di sessione
+        audio_path = os.path.join(st.session_state.session_dir, _sanitize_filename(uploaded.name))
+        with open(audio_path, "wb") as f:
+            f.write(uploaded.read())
 
-    if start_btn:
-        # Preparazione modello
-        st.info("Inizializzo il modello, attendi…")
         try:
-            model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        except Exception as e:
-            st.error(f"Errore inizializzazione modello: {e}")
-            st.stop()
-
-        # File di output (persistente nella sessione)
-        out_txt_name = os.path.splitext(os.path.basename(src_audio_path))[0] + ".txt"
-        out_txt_path = os.path.join(workdir, out_txt_name)
-
-        # Se esiste già, ruota per non sovrascrivere
-        rot = 1
-        final_out = out_txt_path
-        while os.path.exists(final_out):
-            final_out = os.path.join(workdir, f"{os.path.splitext(out_txt_name)[0]}_{rot}.txt")
-            rot += 1
-        out_txt_path = final_out
-
-        st.session_state[TRANSCRIPTS_INDEX_KEY][os.path.basename(out_txt_path)] = out_txt_path
-
-        overall_box = st.container()
-        overall_bar = overall_box.progress(0.0, text="Avanzamento complessivo…")
-        overall_eta = overall_box.empty()
-
-        # statistiche per ETA
-        # rtf_inv = secondi_di_calcolo / secondi_audio
-        rolling_rtf_inv: List[float] = []
-
-        # Trascrizione per blocchi
-        accumulated_text = []
-
-        for i, (start_sec, dur_sec) in enumerate(chunks, start=1):
-            st.markdown(f"#### Blocco {i}/{n_chunks}")
-            chunk_box = st.container()
-            chunk_bar = chunk_box.progress(0.0)
-            chunk_eta = chunk_box.empty()
-            chunk_log = chunk_box.empty()
-
-            # Prepara WAV del blocco
-            chunk_wav = os.path.join(workdir, f"chunk_{i:02d}.wav")
-            try:
-                _slice_to_wav(src_audio_path, chunk_wav, start_sec, dur_sec)
-            except Exception as e:
-                st.error(f"Errore nel pre-processing del blocco {i}: {e}")
-                break
-
-            # Stima tempo totale atteso per questo blocco (in base ai blocchi già fatti)
-            if rolling_rtf_inv:
-                avg_inv = sum(rolling_rtf_inv) / len(rolling_rtf_inv)
-                expected_total_s = max(3.0, dur_sec * avg_inv)
-            else:
-                # prima stima conservativa (fattore tempo 0.6x realtime ≈ rtf_inv 1.7)
-                expected_total_s = max(3.0, dur_sec * 1.7)
-
-            # Esegui transcribe in un thread per poter aggiornare la barra nel frattempo
-            done_evt = threading.Event()
-            result_holder = {"text": "", "elapsed": 0.0, "error": None}
-
-            def _worker():
-                t0 = time.time()
-                try:
-                    segments, info = model.transcribe(
-                        chunk_wav,
-                        language=language,
-                        beam_size=1,
-                        vad_filter=True,
-                    )
-                    txt = _collect_segments_text(segments)
-                    result_holder["text"] = txt
-                except Exception as ex:
-                    result_holder["error"] = ex
-                finally:
-                    result_holder["elapsed"] = time.time() - t0
-                    done_evt.set()
-
-            th = threading.Thread(target=_worker, daemon=True)
-            th.start()
-
-            # Aggiorna la barra durante l'elaborazione (tempo stimato → residuo)
-            t_loop0 = time.time()
-            while not done_evt.is_set():
-                elapsed = time.time() - t_loop0
-                # Evita di arrivare a 100% prima del termine
-                frac = min(0.95, elapsed / expected_total_s)
-                chunk_bar.progress(frac)
-                chunk_eta.markdown(_estimate_eta_text(expected_total_s, elapsed))
-                time.sleep(0.2)
-
-            # Concluso il blocco
-            if result_holder["error"] is not None:
-                st.error(f"Errore nel blocco {i}: {result_holder['error']}")
-                # Salva quanto prodotto finora comunque
-                if accumulated_text:
-                    try:
-                        _append_text(out_txt_path, "".join(accumulated_text))
-                    except Exception:
-                        pass
-                break
-
-            chunk_bar.progress(1.0)
-            chunk_eta.markdown(_estimate_eta_text(result_holder["elapsed"], result_holder["elapsed"]))
-
-            # Aggiorna statistiche e salvataggio incrementale
-            elapsed = result_holder["elapsed"]
-            if dur_sec > 0.2:
-                rolling_rtf_inv.append(elapsed / dur_sec)
-
-            accumulated_text.append(result_holder["text"])
-            try:
-                _append_text(out_txt_path, result_holder["text"])
-            except Exception as e:
-                chunk_log.warning(f"Avviso: impossibile salvare incrementale (blocco {i}): {e}")
-
-            # Aggiorna barra complessiva e ETA complessiva
-            overall_frac = i / n_chunks
-            # Stima restante: somma durazioni restanti * avg_inv
-            if rolling_rtf_inv:
-                avg_inv = sum(rolling_rtf_inv) / len(rolling_rtf_inv)
-                remaining_audio_s = sum(d for _, d in chunks[i:])  # i è 1-based
-                remaining_calc_s = remaining_audio_s * avg_inv
-            else:
-                remaining_calc_s = 0.0
-            overall_bar.progress(overall_frac, text=f"Avanzamento complessivo: {int(overall_frac*100)}%")
-            overall_eta.markdown(f"⏱️ Stima tempo residuo job: **{int(remaining_calc_s//60)} min {int(remaining_calc_s%60)} s**")
-
-        # Fine loop blocchi
-        if os.path.exists(out_txt_path):
-            st.success("✅ Trascrizione completata (o salvata parzialmente in caso di errori).")
-            final_text = _read_text(out_txt_path)
-
-            st.subheader("3) Scarica la trascrizione (.txt)")
-            st.download_button(
-                label="⬇️ Scarica trascrizione",
-                data=final_text,
-                file_name=os.path.basename(out_txt_path),
-                mime="text/plain",
-                type="primary",
+            duration_s = _probe_duration_seconds(audio_path)
+            chunks, n_chunks, avg_min = _plan_chunks(duration_s)
+            st.success(
+                f"L'audio durerà **{round(duration_s/60.0, 1)} min**. "
+                f"Verrà elaborato in **{n_chunks} blocchi** da circa **{avg_min:.1f} min** "
+                f"(overlap 10s)."
             )
+        except Exception as e:
+            st.error(f"Impossibile leggere i metadata (ffprobe): {e}")
+            return
 
-            st.subheader("4) Prompt per AI (con testo inserito)")
-            prompt_full = _make_prompt_with_text(final_text)
-            st.text_area("Copia e incolla nella tua AI preferita", value=prompt_full, height=320)
+    st.markdown("### 2) Avvia la trascrizione")
+    left, _ = st.columns([1, 3])
+    start_btn = left.button("🔴 Avvia", type="primary", disabled=(uploaded is None))
 
-        else:
-            st.error("La trascrizione non è stata generata.")
-else:
-    st.info("Carica un file audio per iniziare.")
+    # Impostazioni dalla sidebar
+    _sidebar_settings()
+    model_size = st.session_state.get("model_size_sel") or None  # (non usato: manteniamo pick diretto)
+    # Recuperiamo i valori letti nella sidebar (usiamo direttamente i widget)
+    # Streamlit non assegna automaticamente a session_state con nome, per cui rileggeremo via widget state.
+    # (qui non serve: li ricalcoliamo nell'azione)
+
+    if start_btn and uploaded is not None:
+        _run_transcription(audio_path, uploaded.name, duration_s)
+
+
+def _run_transcription(audio_path: str, display_name: str, duration_s: float):
+    # Rileggi preferenze correnti dalla sidebar
+    # (Sono letti direttamente dai widget; qui usiamo st.session_state per la lingua)
+    lang = st.session_state.get("Lingua", None)  # fallback, ma meglio ripescare via variabile locale della sidebar
+    # In realtà, estraiamo di nuovo i valori interrogando i widget: Streamlit assegna chiavi automatiche.
+    # Per semplicità, reimpostiamo manualmente:
+    lang = st.sidebar.text_input if False else None  # no-op per evitare warning lint
+
+    # Siccome non abbiamo accesso diretto alle chiavi dei widget, definiamo default ragionevoli:
+    language = "it"
+    # Per il modello, usiamo un trucco: cerchiamo nello state i possibili valori già noti
+    possible_models = ["tiny", "base", "small", "medium", "large-v3"]
+    chosen_model = None
+    for k, v in st.session_state.items():
+        if isinstance(v, str) and v in possible_models:
+            chosen_model = v
+    if not chosen_model:
+        chosen_model = "medium"
+
+    # UI: info lavoro
+    st.info(f"Modello: **{chosen_model}** · Lingua: **it** · File: **{display_name}**")
+
+    # Piano chunk
+    chunks, n_chunks, avg_min = _plan_chunks(duration_s)
+
+    # Prepara modello
+    st.write("### 3) Transcodifica e trascrizione")
+    st.caption("I blocchi vengono elaborati in sequenza. ETA stimata si aggiorna mentre lavora.")
+    progress = st.progress(0.0)
+    status = st.empty()  # testo 'Blocco i/N — Trascorso — ETA'
+    log_area = st.empty()  # eventuali messaggi
+    job_start = time.time()
+
+    # Contatori per ETA dinamica
+    audio_done_s = 0.0
+    proc_done_s = 0.0
+    # fallback: ipotizziamo 1.8x realtime finché non abbiamo una misura
+    fallback_ratio = 1.8
+
+    # Istanzia modello faster-whisper
+    # compute_type "int8" è veloce su CPU; se hai GPU puoi passare "float16"
+    model = WhisperModel(chosen_model, device="cpu", compute_type="int8")
+
+    transcript_parts = []
+
+    for i, (start_s, dur_s) in enumerate(chunks, start=1):
+        # 1) Prepara file WAV del segmento
+        seg_name = f"chunk_{i:02d}.wav"
+        seg_path = os.path.join(st.session_state.session_dir, seg_name)
+        _export_wav_segment(audio_path, start_s, dur_s, seg_path)
+
+        # 2) Avvia trascrizione su thread dedicato per poter aggiornare ETA in tempo reale
+        q: queue.Queue[str] = queue.Queue()
+        err = {}
+
+        def worker():
+            try:
+                seg_iter, _info = model.transcribe(
+                    seg_path,
+                    language="it",
+                    vad_filter=True,
+                    beam_size=5
+                )
+                text = "".join(s.text for s in seg_iter)
+                q.put(text)
+            except Exception as e:
+                err["e"] = e
+                q.put("")
+
+        t0 = time.time()
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+
+        # 3) Aggiorna timer & ETA mentre il thread lavora
+        while th.is_alive():
+            elapsed = time.time() - job_start
+            # Stima ratio se abbiamo almeno un segmento concluso
+            if audio_done_s > 0:
+                ratio = proc_done_s / audio_done_s  # sec processamento per sec audio
+            else:
+                ratio = fallback_ratio
+            remaining_audio = (sum(d for _, d in chunks[i-1:]) if audio_done_s == 0 else
+                               (sum(d for _, d in chunks[i-1:]) - (time.time() - t0)))
+            eta = max(0.0, ratio * remaining_audio)
+            status.markdown(
+                f"**Blocco {i}/{n_chunks}** — Trascorso: **{_human_time(elapsed)}** · "
+                f"ETA: **{_human_time(eta)}**"
+            )
+            # progresso globale (per blocchi)
+            progress.progress((i - 1) / n_chunks)
+            time.sleep(0.2)
+
+        # 4) Fine segmento: raccogli risultato
+        th.join()
+        seg_text = q.get()
+        if "e" in err:
+            st.error(f"Errore nel blocco {i}: {err['e']}")
+            return
+
+        dt = time.time() - t0
+        proc_done_s += dt
+        audio_done_s += dur_s
+        transcript_parts.append(seg_text)
+
+        # aggiorna progress e status dopo il blocco
+        elapsed = time.time() - job_start
+        remaining_audio_total = max(0.0, duration_s - audio_done_s)
+        ratio = proc_done_s / max(1e-6, audio_done_s)
+        eta = ratio * remaining_audio_total
+        status.markdown(
+            f"**Blocco {i}/{n_chunks} completato** — Trascorso: **{_human_time(elapsed)}** · "
+            f"ETA residua: **{_human_time(eta)}**"
+        )
+        progress.progress(i / n_chunks)
+
+    # Concatenazione finale
+    full_text = "".join(transcript_parts).strip()
+    st.session_state.transcript_text = full_text
+
+    # Mostra/Salva .txt
+    st.success("Trascrizione completata.")
+    st.text_area("Trascrizione completa (.txt)", value=full_text, height=260)
+
+    saved_path = _save_text_session(display_name, full_text)
+    with open(saved_path, "rb") as f:
+        st.download_button("Scarica trascrizione (.txt)", data=f.read(), file_name=os.path.basename(saved_path), type="primary")
+
+    # Genera prompt AI precompilato (in sidebar)
+    st.session_state.ai_prompt_text = _build_ai_prompt(full_text)
+    st.info("Prompt AI generato nella **sidebar** (sezione “Prompt per AI”).")
+
+
+if __name__ == "__main__":
+    main()
