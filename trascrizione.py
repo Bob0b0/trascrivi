@@ -1,137 +1,150 @@
+# trascrivi.py
+# Streamlit app per trascrizione audio con faster-whisper
+# Funzioni chiave:
+# - Suddivisione automatica in blocchi 10–12 minuti
+# - Barra di avanzamento per ogni blocco (tempo totale → residuo stimato)
+# - Salvataggio incrementale e persistenza .txt per tutta la sessione
+# - Guida rapida + lettura README.md
+# - Prompt di post-produzione con testo inserito automaticamente
+
+from __future__ import annotations
+
 import os
 import io
+import re
 import math
-import json
 import time
-import hashlib
+import json
+import shutil
+import string
+import random
+import threading
 import tempfile
-from pathlib import Path
+from datetime import datetime
 from typing import List, Tuple
 
 import streamlit as st
-import ffmpeg
 from faster_whisper import WhisperModel
+import ffmpeg
 
 
-# =========================
-# CONFIG / COSTANTI
-# =========================
-APP_TITLE = "Trascrivi – Robusta"
-APP_AUTHOR = "Robusta"
-TARGET_CHUNK_MIN = 6          # ~6 minuti a pezzo, deciso automaticamente
-OVERLAP_SEC = 3               # overlap interno (non esposto all'utente)
-MAX_PARTS = 32                # limite di sicurezza per file molto lunghi
-MAX_RETRIES = 2               # tentativi per pezzo in errore
-MODEL_DEFAULT = "tiny"        # default per test rapidi
-COMPUTE_TYPE = "int8"         # veloce su CPU
-CHUNK_INTERNAL_SEC = 20       # segmentazione interna di faster-whisper per ridurre RAM
+# ============ CONFIGURAZIONE APP ============
+st.set_page_config(page_title="Trascrivi audio", page_icon="🎧", layout="wide")
+
+# [MODIFICA] Autore visibile in app (cerca questa riga per cambiarlo rapidamente)
+AUTHOR_DISPLAY_NAME = "Roberto M."   # << Cambia qui il nome autore
+
+APP_TITLE = "Trascrivi — Whisper (faster-whisper)"
+DEFAULT_LANGUAGE = "it"
+DEFAULT_MODEL = "tiny"  # tiny/base/small/medium/large-v3 ecc.
+# Overlap tra blocchi per non troncare frasi
+CHUNK_OVERLAP_SECONDS = 10.0
+
+# Cartella per-sessione dove salviamo i file (persiste finché la sessione resta viva)
+SESSION_DIR_KEY = "workdir"
+TRANSCRIPTS_INDEX_KEY = "saved_transcripts"
 
 
-# =========================
-# UTIL
-# =========================
-def human_dur(seconds: float) -> str:
-    seconds = int(round(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h:
-        return f"{h}:{m:02}:{s:02}"
-    return f"{m}:{s:02}"
+# ============ UTILS ============
+def _ensure_session_dir() -> str:
+    if SESSION_DIR_KEY not in st.session_state:
+        # cartella temporanea unica per la sessione utente
+        sess_dir = tempfile.mkdtemp(prefix="trascrivi_")
+        st.session_state[SESSION_DIR_KEY] = sess_dir
+    return st.session_state[SESSION_DIR_KEY]
 
 
-def file_sha1(path: str) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()[:12]
+def _safe_filename(name: str) -> str:
+    name = os.path.basename(name)
+    name = re.sub(r"[^\w\-.]+", "_", name, flags=re.UNICODE)
+    return name[:120]
 
 
-def ensure_wav_mono16k(src_path: str, dst_path: str) -> None:
+def _write_bytes(path: str, data: bytes):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _append_text(path: str, text: str):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _probe_duration_seconds(path: str) -> float:
+    """Rileva durata audio in secondi usando ffprobe."""
+    meta = ffmpeg.probe(path)
+    # Preferisci stream audio; altrimenti prendi la durata del formato
+    dur = None
+    for s in meta.get("streams", []):
+        if s.get("codec_type") == "audio" and "duration" in s:
+            dur = float(s["duration"])
+            break
+    if dur is None:
+        dur = float(meta["format"]["duration"])
+    return dur
+
+
+def _compute_chunk_plan(total_sec: float) -> List[Tuple[float, float]]:
+    """
+    Regola: durata_blocco = clamp(total/8, 10min, 12min).
+    Ritorna lista di (start, durata) in secondi, con overlap fisso.
+    """
+    min_chunk = 10 * 60.0
+    max_chunk = 12 * 60.0
+    target = max(min_chunk, min(max_chunk, total_sec / 8.0))
+    step = target - CHUNK_OVERLAP_SECONDS
+    plan = []
+    start = 0.0
+    while start < total_sec:
+        end = min(start + target, total_sec)
+        dur = max(0.0, end - start)
+        if dur > 0.5:
+            plan.append((start, dur))
+        if end >= total_sec:
+            break
+        start = start + step
+    return plan
+
+
+def _slice_to_wav(src_path: str, dst_path: str, start_sec: float, dur_sec: float):
+    """
+    Crea un WAV mono 16 kHz della finestra richiesta.
+    """
     (
         ffmpeg
-        .input(src_path)
-        .output(dst_path, ac=1, ar=16000, format="wav", y=None)
+        .input(src_path, ss=start_sec, t=dur_sec)
+        .output(dst_path, ac=1, ar=16000, format="wav", y="-y")  # mono 16k
         .overwrite_output()
         .run(quiet=True)
     )
 
 
-def probe_duration_seconds(path: str) -> float:
-    try:
-        info = ffmpeg.probe(path)
-        return float(info["format"]["duration"])
-    except Exception:
-        return 0.0
+def _estimate_eta_text(total_s: float, elapsed_s: float) -> str:
+    remain = max(0.0, total_s - elapsed_s)
+    def fmt(s: float) -> str:
+        m, s = divmod(int(round(s)), 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+    return f"Totale stimato: {fmt(total_s)} • Residuo: {fmt(remain)}"
 
 
-def build_plan(duration_s: float) -> List[Tuple[int, int]]:
-    """
-    Restituisce lista di (start_sec, dur_sec) con overlap gestito internamente.
-    Distribuzione uniforme -> meno rischi sugli ultimi pezzi.
-    """
-    if duration_s <= 0:
-        return [(0, 0)]
-    target = TARGET_CHUNK_MIN * 60
-    n_parts = max(1, min(MAX_PARTS, math.ceil(duration_s / target)))
-    base = duration_s / n_parts
-
-    plan = []
-    for i in range(n_parts):
-        start = int(i * base)
-        if i > 0:
-            start = max(0, start - OVERLAP_SEC)
-        end = duration_s if i == n_parts - 1 else int((i + 1) * base + OVERLAP_SEC)
-        end = max(end, start + 1)
-        plan.append((start, int(end - start)))
-    return plan
-
-
-@st.cache_resource(show_spinner=False)
-def load_model(model_size: str):
-    # Nota: num_workers=1 per evitare picchi RAM; cpu_threads = os.cpu_count()
-    return WhisperModel(
-        model_size,
-        device="auto",
-        compute_type=COMPUTE_TYPE,
-        cpu_threads=os.cpu_count() or 4,
-        num_workers=1,
-    )
-
-
-def transcribe_chunk(model, wav_path: str) -> str:
-    """
-    Una chiamata “stretta”, con parametri conservativi per stabilità e RAM.
-    """
-    segments, _ = model.transcribe(
-        wav_path,
-        beam_size=1,
-        vad_filter=True,
-        word_timestamps=False,
-        condition_on_previous_text=False,
-        chunk_length=CHUNK_INTERNAL_SEC,
-        temperature=0.0,
-        compression_ratio_threshold=2.6,
-        log_prob_threshold=-1.0,
-        no_speech_threshold=0.6,
-    )
-    out = []
+def _collect_segments_text(segments) -> str:
+    # segments è un generatore; concateno il testo
+    parts = []
     for seg in segments:
-        out.append(seg.text)
-    return "".join(out).strip()
+        # seg.text è già con spazio iniziale; uniformiamo
+        parts.append(seg.text)
+    return "".join(parts)
 
 
-def write_text(path: str, text: str) -> None:
-    Path(path).write_text(text, encoding="utf-8")
-
-
-def read_text(path: str) -> str:
-    p = Path(path)
-    return p.read_text(encoding="utf-8") if p.exists() else ""
-
-
-def build_editor_prompt(transcript_text: str) -> str:
+def _make_prompt_with_text(transcript: str) -> str:
     return (
         "SEI UN EDITOR PROFESSIONISTA.\n\n"
         "Migliora il testo seguente senza alterare i contenuti: correggi refusi,\n"
@@ -139,185 +152,280 @@ def build_editor_prompt(transcript_text: str) -> str:
         "formattazione leggibile con paragrafi e titoli minimi se opportuno.\n"
         "Mantieni lo stile orale, ma rendilo scorrevole. Lingua: it.\n"
         "<< TESTO DA INSERIRE >>\n"
-        f"[incolla qui il TESTO DA MIGLIORARE]\n\n{transcript_text}\n\n"
         "Output richiesto: testo finale pulito, pronto per la pubblicazione.\n"
         "§§§§§§\n"
         "TESTO DA MIGLIORARE (tra i delimitatori):\n"
+        "[---INIZIO TESTO---]\n"
+        f"{transcript}\n"
+        "[---FINE TESTO---]\n"
     )
 
 
-# =========================
-# UI
-# =========================
-st.set_page_config(APP_TITLE, layout="wide")
-st.title("Trascrizione audio")
-st.caption(f"Autore: **{APP_AUTHOR}**")
+def _init_transcripts_index():
+    if TRANSCRIPTS_INDEX_KEY not in st.session_state:
+        st.session_state[TRANSCRIPTS_INDEX_KEY] = {}  # {label: path}
 
+
+# ============ HEADER ============
+col_title, col_author = st.columns([1, 0.25])
+with col_title:
+    st.title(APP_TITLE)
+with col_author:
+    st.markdown(
+        f"<div style='text-align:right; opacity:0.9;'>Autore: <b>{AUTHOR_DISPLAY_NAME}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+with st.expander("📌 Guida rapida", expanded=True):
+    st.markdown(
+        """
+- Carica un file audio e avvia la trascrizione.
+- L'audio viene diviso **automaticamente** in blocchi da **10–12 min** con una piccola sovrapposizione.
+- Per **ogni blocco** vedi una barra di avanzamento con **stima del tempo residuo**.
+- Il `.txt` viene **salvato dopo ogni blocco** e rimane disponibile finché **la sessione resta aperta**.
+- A fine lavoro trovi il **prompt per AI** con dentro **la trascrizione** già inserita, pronto da copiare.
+        """
+    )
+
+# README (se presente)
+readme_text = None
+try:
+    if os.path.exists("README.md"):
+        readme_text = _read_text("README.md")
+except Exception:
+    readme_text = None
+
+with st.expander("📖 Apri README.md", expanded=False):
+    if readme_text:
+        st.markdown(readme_text)
+    else:
+        st.info("Nessun README.md trovato nel repository.")
+
+st.divider()
+
+
+# ============ SIDEBAR ============
 with st.sidebar:
-    st.header("Impostazioni")
+    st.subheader("Impostazioni")
     model_size = st.selectbox(
-        "Modello",
-        ["tiny", "base", "small", "medium", "large-v3"],
-        index=["tiny", "base", "small", "medium", "large-v3"].index(MODEL_DEFAULT),
-        help="Scegli un modello. Tiny/Base più veloci; Large più accurato ma lento."
+        "Modello Whisper",
+        options=["tiny", "base", "small", "medium", "large-v3"],
+        index=0,
+        help="Usa 'tiny' per test veloci; modelli maggiori = più qualità, più lenti."
     )
-    lang = st.text_input(
-        "Lingua (opzionale)",
-        value="it",
-        help="Codice lingua ISO (es. it, en). Lascia vuoto per auto-detectarla."
-    )
+    language = st.text_input("Lingua", value=DEFAULT_LANGUAGE, help="Codice lingua (es. it, en, fr).")
+    st.caption("Blocchi: automatico 10–12 minuti (impostazione interna).")
+
     st.markdown("---")
-    st.write("Le opzioni tecniche di frazionamento sono automatiche per evitare errori.")
+    st.markdown("### File salvati (sessione)")
+    _init_transcripts_index()
+    if st.session_state[TRANSCRIPTS_INDEX_KEY]:
+        for label, path in list(st.session_state[TRANSCRIPTS_INDEX_KEY].items()):
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read()
+            st.download_button(
+                label=f"⬇️ Scarica {label}",
+                data=data,
+                file_name=os.path.basename(path),
+                mime="text/plain",
+                key=f"dl_{label}"
+            )
+    else:
+        st.caption("Nessun file salvato in questa sessione.")
 
-uploaded = st.file_uploader("Carica un file audio", type=["mp3", "wav", "m4a", "aac", "flac", "ogg"])
+    st.markdown("---")
+    if st.button("🔁 Reimposta sessione (non cancella file locali già scaricati)"):
+        # Non cancelliamo la cartella su disco; azzeriamo solo lo stato
+        for k in [TRANSCRIPTS_INDEX_KEY, SESSION_DIR_KEY]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
-# Stato
-if "log_lines" not in st.session_state:
-    st.session_state.log_lines = []
 
-def log(msg: str):
-    st.session_state.log_lines.append(msg)
+# ============ UPLOAD ============
+st.subheader("1) Carica il file audio")
+uploaded = st.file_uploader(
+    "Formati comuni supportati (mp3, wav, m4a, webm, ...)",
+    type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "webm"],
+    accept_multiple_files=False,
+)
 
-if uploaded:
-    # Salva input su disco
-    work_dir = Path(tempfile.gettempdir()) / "trascrivi"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    src_path = str(work_dir / uploaded.name)
-    with open(src_path, "wb") as f:
-        f.write(uploaded.getbuffer())
+workdir = _ensure_session_dir()
+_init_transcripts_index()
 
-    # Normalizza in wav/mono/16k per stabilità
-    norm_path = str(work_dir / (Path(uploaded.name).stem + "_16k.wav"))
+if uploaded is not None:
+    # Salva l'upload nella cartella di sessione
+    base = _safe_filename(uploaded.name)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    src_audio_path = os.path.join(workdir, f"{ts}_{base}")
+    _write_bytes(src_audio_path, uploaded.getvalue())
+
+    # Info durata
     try:
-        ensure_wav_mono16k(src_path, norm_path)
+        total_sec = _probe_duration_seconds(src_audio_path)
     except Exception as e:
-        st.error(f"Impossibile preparare l'audio (ffmpeg): {e}")
+        st.error(f"Impossibile leggere la durata dell'audio: {e}")
         st.stop()
 
-    duration = probe_duration_seconds(norm_path)
-    st.info(f"Durata: **{human_dur(duration)}**")
+    chunks = _compute_chunk_plan(total_sec)
+    n_chunks = len(chunks)
+    # Anteprima piano di lavorazione
+    avg_chunk_min = sum(d for _, d in chunks) / n_chunks / 60.0 if n_chunks else 0
+    st.success(
+        f"L'audio durerà **{total_sec/60:.1f} min**. "
+        f"Verrà elaborato in **{n_chunks} blocchi** da circa **{avg_chunk_min:.1f} min** (overlap {int(CHUNK_OVERLAP_SECONDS)}s)."
+    )
 
-    # Checkpoint directory per riprese/partial
-    token = f"{Path(uploaded.name).name}-{file_sha1(norm_path)}-{model_size}"
-    ckpt_dir = work_dir / f"ckpt_{token}"
-    ckpt_dir.mkdir(exist_ok=True, parents=True)
+    st.subheader("2) Avvia la trascrizione")
+    start_btn = st.button("🚀 Avvia", type="primary")
 
-    # Piano di slicing
-    plan = build_plan(duration)
-    n_parts = len(plan)
-    st.write(f"Pezzi previsti: **{n_parts}** (auto)")
+    if start_btn:
+        # Preparazione modello
+        st.info("Inizializzo il modello, attendi…")
+        try:
+            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        except Exception as e:
+            st.error(f"Errore inizializzazione modello: {e}")
+            st.stop()
 
-    # Pulsante azione
-    colA, colB = st.columns([1, 1])
-    go = colA.button("Trascrivi")
-    clear_ckpt = colB.button("Riparti da zero")
+        # File di output (persistente nella sessione)
+        out_txt_name = os.path.splitext(os.path.basename(src_audio_path))[0] + ".txt"
+        out_txt_path = os.path.join(workdir, out_txt_name)
 
-    if clear_ckpt:
-        for p in ckpt_dir.glob("*"):
+        # Se esiste già, ruota per non sovrascrivere
+        rot = 1
+        final_out = out_txt_path
+        while os.path.exists(final_out):
+            final_out = os.path.join(workdir, f"{os.path.splitext(out_txt_name)[0]}_{rot}.txt")
+            rot += 1
+        out_txt_path = final_out
+
+        st.session_state[TRANSCRIPTS_INDEX_KEY][os.path.basename(out_txt_path)] = out_txt_path
+
+        overall_box = st.container()
+        overall_bar = overall_box.progress(0.0, text="Avanzamento complessivo…")
+        overall_eta = overall_box.empty()
+
+        # statistiche per ETA
+        # rtf_inv = secondi_di_calcolo / secondi_audio
+        rolling_rtf_inv: List[float] = []
+
+        # Trascrizione per blocchi
+        accumulated_text = []
+
+        for i, (start_sec, dur_sec) in enumerate(chunks, start=1):
+            st.markdown(f"#### Blocco {i}/{n_chunks}")
+            chunk_box = st.container()
+            chunk_bar = chunk_box.progress(0.0)
+            chunk_eta = chunk_box.empty()
+            chunk_log = chunk_box.empty()
+
+            # Prepara WAV del blocco
+            chunk_wav = os.path.join(workdir, f"chunk_{i:02d}.wav")
             try:
-                p.unlink()
-            except Exception:
-                pass
-        st.success("Checkpoint cancellati.")
-
-    if go:
-        model = load_model(model_size)
-
-        # Ripresa: individua pezzi già ok
-        done = {p.stem for p in ckpt_dir.glob("chunk_*.txt")}
-        progress = st.progress(0, text="In elaborazione…")
-        status = st.empty()
-
-        merged_texts: List[str] = []
-        failures = []
-
-        for idx, (ss, dd) in enumerate(plan, start=1):
-            progress.progress((idx - 1) / n_parts, text=f"Preparazione pezzo {idx}/{n_parts}")
-
-            chunk_tag = f"chunk_{idx:03d}"
-            txt_path = ckpt_dir / f"{chunk_tag}.txt"
-            wav_path = ckpt_dir / f"{chunk_tag}.wav"
-
-            # Se già fatto, carica
-            if txt_path.exists():
-                merged_texts.append(read_text(str(txt_path)))
-                status.write(f"✓ {chunk_tag} già pronto")
-                continue
-
-            # Estrai audio pezzo
-            try:
-                (
-                    ffmpeg
-                    .input(norm_path, ss=ss, t=dd)
-                    .output(str(wav_path), ac=1, ar=16000, format="wav", y=None)
-                    .overwrite_output()
-                    .run(quiet=True)
-                )
+                _slice_to_wav(src_audio_path, chunk_wav, start_sec, dur_sec)
             except Exception as e:
-                failures.append(idx)
-                log(f"[estrazione] pezzo {idx}: {e}")
-                status.error(f"Errore estrazione pezzo {idx} – si prosegue")
-                continue
+                st.error(f"Errore nel pre-processing del blocco {i}: {e}")
+                break
 
-            # Trascrivi con retry
-            ok = False
-            err_msg = ""
-            for attempt in range(1, MAX_RETRIES + 2):
+            # Stima tempo totale atteso per questo blocco (in base ai blocchi già fatti)
+            if rolling_rtf_inv:
+                avg_inv = sum(rolling_rtf_inv) / len(rolling_rtf_inv)
+                expected_total_s = max(3.0, dur_sec * avg_inv)
+            else:
+                # prima stima conservativa (fattore tempo 0.6x realtime ≈ rtf_inv 1.7)
+                expected_total_s = max(3.0, dur_sec * 1.7)
+
+            # Esegui transcribe in un thread per poter aggiornare la barra nel frattempo
+            done_evt = threading.Event()
+            result_holder = {"text": "", "elapsed": 0.0, "error": None}
+
+            def _worker():
+                t0 = time.time()
                 try:
-                    progress.progress((idx - 1) / n_parts, text=f"Trascrizione pezzo {idx}/{n_parts} (tentativo {attempt})")
-                    text_out = transcribe_chunk(model, str(wav_path))
-                    write_text(str(txt_path), text_out)
-                    merged_texts.append(text_out)
-                    ok = True
-                    status.write(f"✓ pezzo {idx} trascritto")
-                    break
-                except Exception as e:
-                    err_msg = str(e)
-                    time.sleep(0.5)  # backoff minimo
+                    segments, info = model.transcribe(
+                        chunk_wav,
+                        language=language,
+                        beam_size=1,
+                        vad_filter=True,
+                    )
+                    txt = _collect_segments_text(segments)
+                    result_holder["text"] = txt
+                except Exception as ex:
+                    result_holder["error"] = ex
+                finally:
+                    result_holder["elapsed"] = time.time() - t0
+                    done_evt.set()
 
-            if not ok:
-                failures.append(idx)
-                log(f"[trascrizione] pezzo {idx} fallito: {err_msg}")
-                status.error(f"Errore nel pezzo {idx} – proseguo con i successivi")
+            th = threading.Thread(target=_worker, daemon=True)
+            th.start()
 
-            # Pulizia wav del pezzo per risparmiare spazio
+            # Aggiorna la barra durante l'elaborazione (tempo stimato → residuo)
+            t_loop0 = time.time()
+            while not done_evt.is_set():
+                elapsed = time.time() - t_loop0
+                # Evita di arrivare a 100% prima del termine
+                frac = min(0.95, elapsed / expected_total_s)
+                chunk_bar.progress(frac)
+                chunk_eta.markdown(_estimate_eta_text(expected_total_s, elapsed))
+                time.sleep(0.2)
+
+            # Concluso il blocco
+            if result_holder["error"] is not None:
+                st.error(f"Errore nel blocco {i}: {result_holder['error']}")
+                # Salva quanto prodotto finora comunque
+                if accumulated_text:
+                    try:
+                        _append_text(out_txt_path, "".join(accumulated_text))
+                    except Exception:
+                        pass
+                break
+
+            chunk_bar.progress(1.0)
+            chunk_eta.markdown(_estimate_eta_text(result_holder["elapsed"], result_holder["elapsed"]))
+
+            # Aggiorna statistiche e salvataggio incrementale
+            elapsed = result_holder["elapsed"]
+            if dur_sec > 0.2:
+                rolling_rtf_inv.append(elapsed / dur_sec)
+
+            accumulated_text.append(result_holder["text"])
             try:
-                if wav_path.exists():
-                    wav_path.unlink()
-            except Exception:
-                pass
+                _append_text(out_txt_path, result_holder["text"])
+            except Exception as e:
+                chunk_log.warning(f"Avviso: impossibile salvare incrementale (blocco {i}): {e}")
 
-            progress.progress(idx / n_parts, text=f"Avanzamento {idx}/{n_parts}")
+            # Aggiorna barra complessiva e ETA complessiva
+            overall_frac = i / n_chunks
+            # Stima restante: somma durazioni restanti * avg_inv
+            if rolling_rtf_inv:
+                avg_inv = sum(rolling_rtf_inv) / len(rolling_rtf_inv)
+                remaining_audio_s = sum(d for _, d in chunks[i:])  # i è 1-based
+                remaining_calc_s = remaining_audio_s * avg_inv
+            else:
+                remaining_calc_s = 0.0
+            overall_bar.progress(overall_frac, text=f"Avanzamento complessivo: {int(overall_frac*100)}%")
+            overall_eta.markdown(f"⏱️ Stima tempo residuo job: **{int(remaining_calc_s//60)} min {int(remaining_calc_s%60)} s**")
 
-        # Merge finale
-        final_text = "\n".join(t for t in merged_texts if t.strip())
-        out_txt_path = work_dir / f"{Path(uploaded.name).stem}.trascrizione.txt"
-        write_text(str(out_txt_path), final_text)
+        # Fine loop blocchi
+        if os.path.exists(out_txt_path):
+            st.success("✅ Trascrizione completata (o salvata parzialmente in caso di errori).")
+            final_text = _read_text(out_txt_path)
 
-        st.success("Trascrizione completata (con gestione errori per singolo pezzo).")
-        if failures:
-            st.warning(f"Pezzi non riusciti: {failures}. Puoi rieseguire: riprenderà solo quelli mancanti.")
+            st.subheader("3) Scarica la trascrizione (.txt)")
+            st.download_button(
+                label="⬇️ Scarica trascrizione",
+                data=final_text,
+                file_name=os.path.basename(out_txt_path),
+                mime="text/plain",
+                type="primary",
+            )
 
-        st.download_button(
-            "Scarica trascrizione (.txt)",
-            data=final_text.encode("utf-8"),
-            file_name=out_txt_path.name,
-            mime="text/plain",
-        )
+            st.subheader("4) Prompt per AI (con testo inserito)")
+            prompt_full = _make_prompt_with_text(final_text)
+            st.text_area("Copia e incolla nella tua AI preferita", value=prompt_full, height=320)
 
-        # Prompt post-produzione
-        st.markdown("### Prompt per post-produzione (copia/incolla in qualunque AI)")
-        prompt_text = build_editor_prompt(final_text)
-        st.text_area("Prompt completo", value=prompt_text, height=240)
-        st.download_button(
-            "Scarica prompt (.txt)",
-            data=prompt_text.encode("utf-8"),
-            file_name=f"{Path(uploaded.name).stem}.prompt_editor.txt",
-            mime="text/plain",
-        )
-
-        # Log visibile
-        if st.session_state.log_lines:
-            st.markdown("### Log")
-            st.code("\n".join(st.session_state.log_lines), language="text")
-
+        else:
+            st.error("La trascrizione non è stata generata.")
+else:
+    st.info("Carica un file audio per iniziare.")
